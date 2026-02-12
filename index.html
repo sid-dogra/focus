@@ -744,14 +744,25 @@
       useEffect(() => { storage.set('tasks', tasks); }, [tasks]);
       useEffect(() => { storage.set('settings', settings); }, [settings]);
 
-      // Save to Drive (debounced)
+      // Save to Drive (debounced) — with safeguard against overwriting with empty data
       const saveToDrive = useCallback(() => {
         if (!gcalConnected || !initialSyncDone.current) return;
         if (syncTimer.current) clearTimeout(syncTimer.current);
         syncTimer.current = setTimeout(async () => {
+          const localTasks = storage.get('tasks', []);
+          // SAFEGUARD: never overwrite Drive with empty tasks if Drive has data
+          if (localTasks.length === 0) {
+            try {
+              const remote = await DriveSync.load();
+              if (remote && remote.tasks && remote.tasks.length > 0) {
+                console.warn('DriveSync: skipping save — local is empty but Drive has', remote.tasks.length, 'tasks');
+                return;
+              }
+            } catch {}
+          }
           setSyncStatus('syncing');
           const ok = await DriveSync.save({
-            tasks: storage.get('tasks', []),
+            tasks: localTasks,
             settings: storage.get('settings', DEFAULT_SETTINGS),
             lastModified: Date.now(),
           });
@@ -774,21 +785,25 @@
                 if (storage.get('gcal_connected', false)) {
                   GCalService.authorize(false).then(async () => {
                     setGcalConnected(true);
-                    // Load from Drive and merge
+                    // Load from Drive and merge (union merge — never lose data)
                     try {
                       setSyncStatus('syncing');
                       const remote = await DriveSync.load();
-                      if (remote && remote.lastModified) {
-                        const localTasks = storage.get('tasks', []);
-                        const localModified = storage.get('lastSyncTime', 0);
-                        if (remote.lastModified > localModified) {
-                          // Remote is newer — use remote data but keep any purely-local new tasks
-                          const remoteIds = new Set((remote.tasks || []).map(t => t.id));
-                          const localOnly = localTasks.filter(t => !remoteIds.has(t.id) && new Date(t.createdAt).getTime() > localModified);
-                          const merged = [...(remote.tasks || []), ...localOnly];
-                          setTasks(merged);
-                          if (remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
-                        }
+                      const localTasks = storage.get('tasks', []);
+                      const remoteTasks = (remote && remote.tasks) || [];
+
+                      if (remoteTasks.length > 0 || localTasks.length > 0) {
+                        // Union merge: combine both, remote wins on conflicts (by id)
+                        const remoteMap = new Map(remoteTasks.map(t => [t.id, t]));
+                        const localMap = new Map(localTasks.map(t => [t.id, t]));
+                        // Start with all remote tasks
+                        const merged = [...remoteTasks];
+                        // Add any local tasks not in remote
+                        localTasks.forEach(t => {
+                          if (!remoteMap.has(t.id)) merged.push(t);
+                        });
+                        setTasks(merged);
+                        if (remote && remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
                         storage.set('lastSyncTime', Date.now());
                       }
                       initialSyncDone.current = true;
@@ -847,17 +862,19 @@
           storage.set('gcal_last_fetch', Date.now());
           notify('Google Calendar connected!');
           await fetchEvents();
-          // Load from Drive on first manual connect
+          // Load from Drive on first manual connect (union merge — never lose data)
           if (!initialSyncDone.current) {
             try {
               const remote = await DriveSync.load();
-              if (remote && remote.tasks && remote.tasks.length > 0) {
-                const localTasks = storage.get('tasks', []);
-                const remoteIds = new Set(remote.tasks.map(t => t.id));
-                const localOnly = localTasks.filter(t => !remoteIds.has(t.id));
-                setTasks([...remote.tasks, ...localOnly]);
-                if (remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
-                notify('Synced data from cloud');
+              const localTasks = storage.get('tasks', []);
+              const remoteTasks = (remote && remote.tasks) || [];
+              if (remoteTasks.length > 0 || localTasks.length > 0) {
+                const remoteMap = new Map(remoteTasks.map(t => [t.id, t]));
+                const merged = [...remoteTasks];
+                localTasks.forEach(t => { if (!remoteMap.has(t.id)) merged.push(t); });
+                setTasks(merged);
+                if (remote && remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
+                if (remoteTasks.length > 0) notify('Synced data from cloud');
               }
               storage.set('lastSyncTime', Date.now());
             } catch (err) { console.warn('Drive sync on connect failed', err); }
