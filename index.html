@@ -768,9 +768,12 @@
       const quickWins = incompleteTasks.filter(t => t.effort === 'quick' && !overdue.includes(t) && !urgent.includes(t));
 
       const weekend = isWeekend(selectedDate);
-      const startHour = weekend ? settings.weekendAvailableAfter : settings.weekdayAvailableAfter;
-      const endHour = weekend ? settings.weekendAvailableUntil : settings.weekdayAvailableUntil;
-      const hours = Array.from({ length: endHour - startHour }, (_, i) => startHour + i);
+      const availStartHour = weekend ? settings.weekendAvailableAfter : settings.weekdayAvailableAfter;
+      const availEndHour = weekend ? settings.weekendAvailableUntil : settings.weekdayAvailableUntil;
+      // Show full 24-hour day
+      const displayStartHour = 0;
+      const displayEndHour = 24;
+      const hours = Array.from({ length: displayEndHour - displayStartHour }, (_, i) => displayStartHour + i);
 
       return (
         <div className="space-y-6 fade-in">
@@ -835,15 +838,17 @@
                   endMinutes: timeToMinutes(new Date(e.end).getHours(), new Date(e.end).getMinutes()),
                 }));
 
+                const isAvailableHour = hour >= availStartHour && hour < availEndHour;
+
                 return (
                   <React.Fragment key={hour}>
-                    <div className="time-slot px-2 py-2 text-xs text-gray-400 text-right font-medium">
+                    <div className={`time-slot px-2 py-2 text-xs text-right font-medium ${isAvailableHour ? 'text-violet-400' : 'text-gray-300'}`}>
                       {fmt.timeShort(hour)}
                     </div>
-                    <div className="time-slot px-2 py-1 relative">
+                    <div className={`time-slot px-2 py-1 relative ${!isAvailableHour ? 'bg-gray-50/50' : ''}`}>
                       {displayBlocks.filter(b => {
                         const blockStartHour = Math.floor(b.startMinutes / 60);
-                        return blockStartHour === hour || (b.startMinutes < timeToMinutes(hour) && hour === startHour);
+                        return blockStartHour === hour || (b.startMinutes < timeToMinutes(hour) && hour === displayStartHour);
                       }).map(block => {
                         if (block.type === 'event') {
                           const cls = block.classification;
