@@ -1171,7 +1171,7 @@
                     })}
                   </div>
                   {/* Blocks area */}
-                  <div className="relative select-none" style={{ height: totalHeight }} ref={timelineRef}
+                  <div className="relative select-none" style={{ height: totalHeight, touchAction: 'none' }} ref={timelineRef}
                     onMouseDown={(e) => {
                       if (e.target !== e.currentTarget && !e.target.classList.contains('hour-grid-line')) return;
                       e.preventDefault();
@@ -1191,6 +1191,28 @@
                       };
                       document.addEventListener('mousemove', handleMove);
                       document.addEventListener('mouseup', handleUp);
+                    }}
+                    onTouchStart={(e) => {
+                      if (e.target !== e.currentTarget && !e.target.classList.contains('hour-grid-line')) return;
+                      const touch = e.touches[0];
+                      const rect = timelineRef.current.getBoundingClientRect();
+                      const offsetY = touch.clientY - rect.top;
+                      const startMins = Math.max(0, Math.min(1440, snapTo15(dayStartMins + (offsetY / HOUR_HEIGHT) * 60)));
+                      onDragChange && onDragChange({ startMinutes: startMins, currentMinutes: startMins });
+                      const handleTouchMove = (te) => {
+                        te.preventDefault();
+                        const t = te.touches[0];
+                        const oy = t.clientY - rect.top;
+                        const cm = Math.max(0, Math.min(1440, snapTo15(dayStartMins + (oy / HOUR_HEIGHT) * 60)));
+                        onDragChange && onDragChange({ startMinutes: startMins, currentMinutes: cm });
+                      };
+                      const handleTouchEnd = () => {
+                        document.removeEventListener('touchmove', handleTouchMove);
+                        document.removeEventListener('touchend', handleTouchEnd);
+                        onDragEnd && onDragEnd();
+                      };
+                      document.addEventListener('touchmove', handleTouchMove, { passive: false });
+                      document.addEventListener('touchend', handleTouchEnd);
                     }}>
                     {/* Hour grid lines + available shading */}
                     {hours.map(hour => {
