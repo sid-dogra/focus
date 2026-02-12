@@ -709,6 +709,10 @@
               Sign in with Google
             </button>
             <p className="text-xs text-gray-400 mt-4">Only authorized accounts can access this app.</p>
+            <button onClick={() => { localStorage.clear(); sessionStorage.clear(); window.location.reload(); }}
+              className="text-[10px] text-gray-300 hover:text-red-400 mt-6 transition-colors">
+              Reset app data
+            </button>
           </div>
         </div>
       );
