@@ -1538,9 +1538,16 @@
         }
       });
 
-      // Quick-assign helper
+      // Quick-assign helper — also clear scheduled time if moving to a different day
       const assignToDay = (taskId, dateStr) => {
-        updateTask(taskId, { assignedDate: dateStr || null });
+        const task = tasks.find(t => t.id === taskId);
+        const updates = { assignedDate: dateStr || null };
+        if (task && task.scheduledDate && task.scheduledDate !== dateStr) {
+          updates.scheduledStart = null;
+          updates.scheduledEnd = null;
+          updates.scheduledDate = null;
+        }
+        updateTask(taskId, updates);
       };
 
       return (
@@ -2148,7 +2155,7 @@
                       const isSelected = assignedDate === dateStr;
                       const isPast = d < new Date(new Date().toDateString());
                       return (
-                        <button key={dateStr} type="button" onClick={() => setAssignedDate(isSelected ? '' : dateStr)}
+                        <button key={dateStr} type="button" onClick={() => { const newDate = isSelected ? '' : dateStr; setAssignedDate(newDate); if (hasScheduledTime && newDate && schedDate !== newDate) { setSchedDate(newDate); } if (!newDate) { setHasScheduledTime(false); } }}
                           className={`w-9 h-9 text-xs font-semibold rounded-lg transition-colors ${isSelected ? 'bg-violet-600 text-white' : isPast ? 'bg-gray-50 text-gray-300' : 'bg-gray-50 text-gray-600 hover:bg-gray-100'}`}>
                           <div className="text-[10px] leading-tight">{dayLabel}</div>
                           <div className="text-[10px] leading-tight">{d.getDate()}</div>
