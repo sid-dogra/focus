@@ -613,6 +613,7 @@
       const [sidebarOpen, setSidebarOpen] = useState(false);
       const [schedule, setSchedule] = useState(null);
       const [notification, setNotification] = useState(null);
+      const [eventPopover, setEventPopover] = useState(null); // { event, x, y }
 
       // Persist
       useEffect(() => { storage.set('tasks', tasks); }, [tasks]);
@@ -919,10 +920,12 @@
             {/* Content */}
             <div className="flex-1 overflow-y-auto p-4 md:p-6">
               {view === 'calendar' && calendarMode === 'day' && <TodayView tasks={tasks} schedule={schedule} calendarEvents={calendarEvents} selectedDate={selectedDate}
-                settings={settings} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }} />}
+                settings={settings} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
+                onEventClick={(block, ev) => setEventPopover({ event: block, x: ev.clientX, y: ev.clientY })} />}
               {view === 'calendar' && calendarMode === 'week' && <WeekView tasks={tasks} calendarEvents={calendarEvents} selectedDate={selectedDate} settings={settings}
                 toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
-                onDayClick={(d) => { setSelectedDate(d); setCalendarMode('day'); }} />}
+                onDayClick={(d) => { setSelectedDate(d); setCalendarMode('day'); }}
+                onEventClick={(block, ev) => setEventPopover({ event: block, x: ev.clientX, y: ev.clientY })} />}
               {view === 'calendar' && calendarMode === 'month' && <MonthView tasks={tasks} calendarEvents={calendarEvents} selectedDate={selectedDate}
                 settings={settings} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
                 onDayClick={(d) => { setSelectedDate(d); setCalendarMode('day'); }} />}
@@ -937,6 +940,41 @@
           {showTaskModal && <TaskModal task={editingTask} onSave={(t) => { editingTask ? updateTask(editingTask.id, t) : addTask(t); setShowTaskModal(false); }}
             onClose={() => setShowTaskModal(false)} />}
 
+          {/* Event Popover */}
+          {eventPopover && (() => {
+            const ep = eventPopover.event;
+            const startTime = ep.startMinutes != null
+              ? fmt.timeShort(Math.floor(ep.startMinutes / 60), ep.startMinutes % 60)
+              : ep.start ? fmt.time(ep.start) : '';
+            const endTime = ep.endMinutes != null
+              ? fmt.timeShort(Math.floor(ep.endMinutes / 60), ep.endMinutes % 60)
+              : ep.end ? fmt.time(ep.end) : '';
+            const cls = ep.classification || classifyEvent(ep.title, settings);
+            const clsColors = cls === 'soft'
+              ? { bg: '#F3F4F6', border: '#D1D5DB', text: '#4B5563', label: 'Soft / Available' }
+              : cls === 'academic'
+              ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9', label: 'Academic' }
+              : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8', label: 'Hard Block' };
+            const popLeft = Math.min(eventPopover.x, window.innerWidth - 280);
+            const popTop = Math.min(eventPopover.y + 8, window.innerHeight - 160);
+            return (
+              <div className="fixed inset-0 z-50" onClick={() => setEventPopover(null)} onKeyDown={(e) => e.key === 'Escape' && setEventPopover(null)}>
+                <div className="absolute bg-white rounded-lg shadow-xl border border-gray-200 w-64 p-3" style={{ left: popLeft, top: popTop }} onClick={(e) => e.stopPropagation()}>
+                  <div className="flex items-start justify-between mb-1">
+                    <div className="font-semibold text-sm text-gray-900 leading-snug pr-2">{ep.title}</div>
+                    <button onClick={() => setEventPopover(null)} className="text-gray-400 hover:text-gray-600 text-lg leading-none">&times;</button>
+                  </div>
+                  <div className="text-xs text-gray-500 mb-1.5">{startTime} – {endTime}</div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: clsColors.border }} />
+                    <span className="text-xs" style={{ color: clsColors.text }}>{clsColors.label}</span>
+                  </div>
+                  {(ep.calendarName || (ep.event && ep.event.calendarName)) && <div className="text-xs text-gray-400 mt-1.5">📅 {ep.calendarName || ep.event.calendarName}</div>}
+                </div>
+              </div>
+            );
+          })()}
+
           {/* Notification */}
           {notification && (
             <div className={`fixed bottom-4 right-4 px-4 py-2.5 rounded-lg text-sm font-medium shadow-lg fade-in z-50 ${notification.type === 'error' ? 'bg-red-500 text-white' : 'bg-gray-900 text-white'}`}>
@@ -948,7 +986,7 @@
     }
 
     // ===== TODAY VIEW =====
-    function TodayView({ tasks, schedule, calendarEvents, selectedDate, settings, toggleDone, onEdit }) {
+    function TodayView({ tasks, schedule, calendarEvents, selectedDate, settings, toggleDone, onEdit, onEventClick }) {
       const incompleteTasks = tasks.filter(t => t.status !== 'done');
       const now = new Date();
       const dangerMs = settings.dangerZoneHours * 60 * 60 * 1000;
@@ -1072,8 +1110,9 @@
                             ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9' }
                             : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8' };
                           return (
-                            <div key={block.id} className="absolute rounded-md px-2 py-1 text-xs font-medium overflow-hidden z-10"
-                              style={{ top, height: height - 2, left: `calc(${leftPct}% + 4px)`, width: `calc(${widthPct}% - 8px)`, backgroundColor: colors.bg, borderLeft: `3px solid ${colors.border}`, color: colors.text }}>
+                            <div key={block.id} className="absolute rounded-md px-2 py-1 text-xs font-medium overflow-hidden z-10 cursor-pointer hover:brightness-95"
+                              style={{ top, height: height - 2, left: `calc(${leftPct}% + 4px)`, width: `calc(${widthPct}% - 8px)`, backgroundColor: colors.bg, borderLeft: `3px solid ${colors.border}`, color: colors.text }}
+                              onClick={(ev) => onEventClick && onEventClick(block, ev)}>
                               <div className="truncate">{block.title}</div>
                               {height > 30 && <div className="text-[10px] opacity-60">{fmt.timeShort(Math.floor(block.startMinutes/60), block.startMinutes%60)} – {fmt.timeShort(Math.floor(block.endMinutes/60), block.endMinutes%60)}</div>}
                               {cls === 'soft' && <span className="text-[10px] opacity-50">(available)</span>}
@@ -1132,7 +1171,7 @@
     }
 
     // ===== WEEK VIEW =====
-    function WeekView({ tasks, calendarEvents, selectedDate, settings, toggleDone, onEdit, onDayClick }) {
+    function WeekView({ tasks, calendarEvents, selectedDate, settings, toggleDone, onEdit, onDayClick, onEventClick }) {
       const weekStart = new Date(selectedDate);
       const dayOfWeek = weekStart.getDay();
       weekStart.setDate(weekStart.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
@@ -1217,8 +1256,9 @@
                           ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9' }
                           : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8' };
                         return (
-                          <div key={e.id} className="absolute rounded px-1 py-0.5 text-[10px] font-medium overflow-hidden z-10"
-                            style={{ top, height: height - 1, left: `calc(${leftPct}% + 2px)`, width: `calc(${widthPct}% - 4px)`, backgroundColor: colors.bg, borderLeft: `2px solid ${colors.border}`, color: colors.text }}>
+                          <div key={e.id} className="absolute rounded px-1 py-0.5 text-[10px] font-medium overflow-hidden z-10 cursor-pointer hover:brightness-95"
+                            style={{ top, height: height - 1, left: `calc(${leftPct}% + 2px)`, width: `calc(${widthPct}% - 4px)`, backgroundColor: colors.bg, borderLeft: `2px solid ${colors.border}`, color: colors.text }}
+                            onClick={(ev) => { ev.stopPropagation(); onEventClick && onEventClick({ ...e, startMinutes: e.startMinutes, endMinutes: e.endMinutes, classification: cls }, ev); }}>
                             <div className="truncate leading-tight">{e.title}</div>
                           </div>
                         );
