@@ -585,7 +585,7 @@
 
         // Check stored session
         try {
-          const stored = sessionStorage.getItem('focus_auth');
+          const stored = localStorage.getItem('focus_auth');
           if (stored) {
             const parsed = JSON.parse(stored);
             if (allowedEmails.map(e => e.toLowerCase()).includes(parsed.email.toLowerCase())) {
@@ -608,7 +608,7 @@
               }).then(r => r.json()).then(info => {
                 if (info.email && allowedEmails.map(e => e.toLowerCase()).includes(info.email.toLowerCase())) {
                   const userData = { email: info.email, name: info.name, picture: info.picture };
-                  sessionStorage.setItem('focus_auth', JSON.stringify(userData));
+                  localStorage.setItem('focus_auth', JSON.stringify(userData));
                   setUser(userData);
                 } else {
                   setDenied(true);
@@ -632,7 +632,7 @@
                   const payload = JSON.parse(atob(response.credential.split('.')[1]));
                   if (allowedEmails.map(e => e.toLowerCase()).includes(payload.email.toLowerCase())) {
                     const userData = { email: payload.email, name: payload.name, picture: payload.picture };
-                    sessionStorage.setItem('focus_auth', JSON.stringify(userData));
+                    localStorage.setItem('focus_auth', JSON.stringify(userData));
                     setUser(userData);
                     setDenied(false);
                   } else {
@@ -681,7 +681,7 @@
               <p className="text-sm text-gray-500 mb-4">
                 {user?.email || 'Your account'} is not authorized to use this app.
               </p>
-              <button onClick={() => { sessionStorage.removeItem('focus_auth'); setDenied(false); setUser(null); }}
+              <button onClick={() => { localStorage.removeItem('focus_auth'); setDenied(false); setUser(null); }}
                 className="px-4 py-2 text-sm font-medium text-violet-600 hover:bg-violet-50 rounded-lg">
                 Try another account
               </button>
@@ -1042,12 +1042,12 @@
               )}
               {settings.googleClientId && (() => {
                 try {
-                  const authUser = JSON.parse(sessionStorage.getItem('focus_auth') || 'null');
+                  const authUser = JSON.parse(localStorage.getItem('focus_auth') || 'null');
                   if (!authUser) return null;
                   return (
                     <div className="mt-3 pt-3 border-t border-gray-100 flex items-center justify-between">
                       <span className="text-xs text-gray-400 truncate">{authUser.email}</span>
-                      <button onClick={() => { sessionStorage.removeItem('focus_auth'); window.location.reload(); }}
+                      <button onClick={() => { localStorage.removeItem('focus_auth'); window.location.reload(); }}
                         className="text-xs text-gray-400 hover:text-red-500 ml-2 flex-shrink-0">Sign out</button>
                     </div>
                   );
