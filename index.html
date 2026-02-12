@@ -118,6 +118,57 @@
     const minutesToTime = (mins) => ({ h: Math.floor(mins / 60), m: mins % 60 });
     const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
+    // ===== OVERLAP LAYOUT =====
+    // Groups overlapping items and assigns column/totalColumns so they render side-by-side
+    function layoutOverlaps(items) {
+      // items must have startMinutes and endMinutes
+      const sorted = [...items].sort((a, b) => a.startMinutes - b.startMinutes || a.endMinutes - b.endMinutes);
+      const groups = []; // each group is a set of overlapping items
+      let currentGroup = [];
+      let groupEnd = -1;
+
+      for (const item of sorted) {
+        if (currentGroup.length === 0 || item.startMinutes < groupEnd) {
+          currentGroup.push(item);
+          groupEnd = Math.max(groupEnd, item.endMinutes);
+        } else {
+          groups.push(currentGroup);
+          currentGroup = [item];
+          groupEnd = item.endMinutes;
+        }
+      }
+      if (currentGroup.length > 0) groups.push(currentGroup);
+
+      // Assign columns within each group
+      const layoutMap = new Map(); // id -> { col, totalCols }
+      for (const group of groups) {
+        const columns = [];
+        for (const item of group) {
+          let placed = false;
+          for (let c = 0; c < columns.length; c++) {
+            const lastInCol = columns[c];
+            if (item.startMinutes >= lastInCol.endMinutes) {
+              columns[c] = item;
+              layoutMap.set(item.id, { col: c, totalCols: 0 });
+              placed = true;
+              break;
+            }
+          }
+          if (!placed) {
+            layoutMap.set(item.id, { col: columns.length, totalCols: 0 });
+            columns.push(item);
+          }
+        }
+        // Set totalCols for all items in this group
+        const totalCols = columns.length;
+        for (const item of group) {
+          const info = layoutMap.get(item.id);
+          info.totalCols = totalCols;
+        }
+      }
+      return layoutMap;
+    }
+
     // ===== GOOGLE CALENDAR SERVICE =====
     const GCalService = {
       _tokenClient: null,
@@ -156,17 +207,16 @@
         }
       },
 
-      async authorize() {
+      async authorize(forceConsent = false) {
         return new Promise((resolve, reject) => {
           if (!this._tokenClient) return reject('Google not initialized');
-          const origCb = this._tokenClient.callback;
           this._tokenClient.callback = (resp) => {
             if (resp.error) return reject(resp.error);
             this._accessToken = resp.access_token;
             gapi.client.setToken({ access_token: resp.access_token });
             resolve(resp.access_token);
           };
-          this._tokenClient.requestAccessToken({ prompt: 'consent' });
+          this._tokenClient.requestAccessToken({ prompt: forceConsent ? 'consent' : '' });
         });
       },
 
@@ -525,13 +575,21 @@
       useEffect(() => { storage.set('settings', settings); }, [settings]);
       useEffect(() => { storage.set('eventClassifications', eventClassifications); }, [eventClassifications]);
 
-      // Init Google Calendar
+      // Init Google Calendar and auto-connect
       useEffect(() => {
         if (settings.googleClientId) {
           const interval = setInterval(() => {
             if (window.gapi && window.google?.accounts?.oauth2) {
               clearInterval(interval);
-              GCalService.init(settings.googleClientId, () => {});
+              GCalService.init(settings.googleClientId, () => {
+                // Auto-connect silently (no popup if previously authorized)
+                GCalService.authorize(false).then(() => {
+                  setGcalConnected(true);
+                }).catch(() => {
+                  // Silent auth failed — user will need to click Connect
+                  console.log('Auto-connect: needs manual authorization');
+                });
+              });
             }
           }, 500);
           return () => clearInterval(interval);
@@ -564,12 +622,23 @@
       const connectGCal = async () => {
         setGcalLoading(true);
         try {
-          await GCalService.authorize();
+          await GCalService.authorize(true);
           setGcalConnected(true);
           notify('Google Calendar connected!');
           await fetchEvents();
         } catch (err) {
           notify('Failed to connect: ' + err, 'error');
+        }
+        setGcalLoading(false);
+      };
+
+      const refreshGCal = async () => {
+        setGcalLoading(true);
+        try {
+          await fetchEvents();
+          notify('Calendar refreshed!');
+        } catch (err) {
+          notify('Failed to refresh: ' + err, 'error');
         }
         setGcalLoading(false);
       };
@@ -802,7 +871,7 @@
               {view === 'all' && <AllTasksView tasks={tasks} toggleDone={toggleDone} deleteTask={deleteTask}
                 onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }} />}
               {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} gcalConnected={gcalConnected}
-                connectGCal={connectGCal} gcalLoading={gcalLoading} calendarEvents={calendarEvents}
+                connectGCal={connectGCal} refreshGCal={refreshGCal} gcalLoading={gcalLoading} calendarEvents={calendarEvents}
                 eventClassifications={eventClassifications} setEventClassifications={setEventClassifications} />}
             </div>
           </main>
@@ -928,42 +997,48 @@
                           style={{ top: (hour - displayStartHour) * HOUR_HEIGHT, height: HOUR_HEIGHT }} />
                       );
                     })}
-                    {/* Positioned blocks */}
-                    {allBlocks.map(block => {
-                      const top = ((block.startMinutes - dayStartMins) / 60) * HOUR_HEIGHT;
-                      const height = Math.max(((block.endMinutes - block.startMinutes) / 60) * HOUR_HEIGHT, 20);
+                    {/* Positioned blocks with overlap layout */}
+                    {(() => {
+                      const overlapLayout = layoutOverlaps(allBlocks);
+                      return allBlocks.map(block => {
+                        const top = ((block.startMinutes - dayStartMins) / 60) * HOUR_HEIGHT;
+                        const height = Math.max(((block.endMinutes - block.startMinutes) / 60) * HOUR_HEIGHT, 20);
+                        const layout = overlapLayout.get(block.id) || { col: 0, totalCols: 1 };
+                        const widthPct = 100 / layout.totalCols;
+                        const leftPct = layout.col * widthPct;
 
-                      if (block.type === 'event') {
-                        const cls = block.classification;
-                        const colors = cls === 'soft'
-                          ? { bg: '#F3F4F6', border: '#D1D5DB', text: '#4B5563' }
-                          : cls === 'academic'
-                          ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9' }
-                          : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8' };
-                        return (
-                          <div key={block.id} className="absolute left-1 right-2 rounded-md px-2 py-1 text-xs font-medium overflow-hidden z-10"
-                            style={{ top, height: height - 2, backgroundColor: colors.bg, borderLeft: `3px solid ${colors.border}`, color: colors.text }}>
-                            <div className="truncate">{block.title}</div>
-                            {height > 30 && <div className="text-[10px] opacity-60">{fmt.timeShort(Math.floor(block.startMinutes/60), block.startMinutes%60)} – {fmt.timeShort(Math.floor(block.endMinutes/60), block.endMinutes%60)}</div>}
-                            {cls === 'soft' && <span className="text-[10px] opacity-50">(available)</span>}
-                          </div>
-                        );
-                      }
-                      if (block.type === 'task' || block.type === 'soft-suggestion') {
-                        const cat = CATEGORIES[block.task.category];
-                        const dur = block.endMinutes - block.startMinutes;
-                        return (
-                          <div key={block.id} className="absolute left-1 right-2 rounded-md px-2 py-1 text-xs font-medium overflow-hidden cursor-pointer hover:opacity-80 z-10"
-                            style={{ top, height: height - 2, backgroundColor: cat.light, borderLeft: `3px solid ${cat.color}` }}
-                            onClick={() => onEdit(block.task)}>
-                            <div className="truncate">{block.task.title}</div>
-                            {height > 30 && <div className="text-[10px] opacity-60">{dur}m · {fmt.timeShort(Math.floor(block.startMinutes/60), block.startMinutes%60)}</div>}
-                            {block.type === 'soft-suggestion' && <span className="text-[10px] opacity-50">💡</span>}
-                          </div>
-                        );
-                      }
-                      return null;
-                    })}
+                        if (block.type === 'event') {
+                          const cls = block.classification;
+                          const colors = cls === 'soft'
+                            ? { bg: '#F3F4F6', border: '#D1D5DB', text: '#4B5563' }
+                            : cls === 'academic'
+                            ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9' }
+                            : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8' };
+                          return (
+                            <div key={block.id} className="absolute rounded-md px-2 py-1 text-xs font-medium overflow-hidden z-10"
+                              style={{ top, height: height - 2, left: `calc(${leftPct}% + 4px)`, width: `calc(${widthPct}% - 8px)`, backgroundColor: colors.bg, borderLeft: `3px solid ${colors.border}`, color: colors.text }}>
+                              <div className="truncate">{block.title}</div>
+                              {height > 30 && <div className="text-[10px] opacity-60">{fmt.timeShort(Math.floor(block.startMinutes/60), block.startMinutes%60)} – {fmt.timeShort(Math.floor(block.endMinutes/60), block.endMinutes%60)}</div>}
+                              {cls === 'soft' && <span className="text-[10px] opacity-50">(available)</span>}
+                            </div>
+                          );
+                        }
+                        if (block.type === 'task' || block.type === 'soft-suggestion') {
+                          const cat = CATEGORIES[block.task.category];
+                          const dur = block.endMinutes - block.startMinutes;
+                          return (
+                            <div key={block.id} className="absolute rounded-md px-2 py-1 text-xs font-medium overflow-hidden cursor-pointer hover:opacity-80 z-10"
+                              style={{ top, height: height - 2, left: `calc(${leftPct}% + 4px)`, width: `calc(${widthPct}% - 8px)`, backgroundColor: cat.light, borderLeft: `3px solid ${cat.color}` }}
+                              onClick={() => onEdit(block.task)}>
+                              <div className="truncate">{block.task.title}</div>
+                              {height > 30 && <div className="text-[10px] opacity-60">{dur}m · {fmt.timeShort(Math.floor(block.startMinutes/60), block.startMinutes%60)}</div>}
+                              {block.type === 'soft-suggestion' && <span className="text-[10px] opacity-50">💡</span>}
+                            </div>
+                          );
+                        }
+                        return null;
+                      });
+                    })()}
                     {/* Current time indicator */}
                     {new Date(selectedDate).toDateString() === new Date().toDateString() && (() => {
                       const nowMins = timeToMinutes(new Date().getHours(), new Date().getMinutes());
@@ -1064,27 +1139,34 @@
                       <div key={h} className="absolute w-full border-t border-gray-50"
                         style={{ top: h * HOUR_HEIGHT, height: HOUR_HEIGHT }} />
                     ))}
-                    {/* Events */}
-                    {dayEvents.map(e => {
-                      const es = new Date(e.start);
-                      const ee = new Date(e.end);
-                      const startMins = timeToMinutes(es.getHours(), es.getMinutes());
-                      const endMins = timeToMinutes(ee.getHours(), ee.getMinutes());
-                      const top = (startMins / 60) * HOUR_HEIGHT;
-                      const height = Math.max(((endMins - startMins) / 60) * HOUR_HEIGHT, 16);
-                      const cls = eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard';
-                      const colors = cls === 'soft'
-                        ? { bg: '#F3F4F6', border: '#D1D5DB', text: '#4B5563' }
-                        : cls === 'academic'
-                        ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9' }
-                        : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8' };
-                      return (
-                        <div key={e.id} className="absolute left-0.5 right-0.5 rounded px-1 py-0.5 text-[10px] font-medium overflow-hidden z-10"
-                          style={{ top, height: height - 1, backgroundColor: colors.bg, borderLeft: `2px solid ${colors.border}`, color: colors.text }}>
-                          <div className="truncate leading-tight">{e.title}</div>
-                        </div>
-                      );
-                    })}
+                    {/* Events with overlap layout */}
+                    {(() => {
+                      const eventsWithMins = dayEvents.map(e => {
+                        const es = new Date(e.start);
+                        const ee = new Date(e.end);
+                        return { ...e, startMinutes: timeToMinutes(es.getHours(), es.getMinutes()), endMinutes: timeToMinutes(ee.getHours(), ee.getMinutes()) };
+                      });
+                      const overlapLayout = layoutOverlaps(eventsWithMins);
+                      return eventsWithMins.map(e => {
+                        const top = (e.startMinutes / 60) * HOUR_HEIGHT;
+                        const height = Math.max(((e.endMinutes - e.startMinutes) / 60) * HOUR_HEIGHT, 16);
+                        const layout = overlapLayout.get(e.id) || { col: 0, totalCols: 1 };
+                        const widthPct = 100 / layout.totalCols;
+                        const leftPct = layout.col * widthPct;
+                        const cls = eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard';
+                        const colors = cls === 'soft'
+                          ? { bg: '#F3F4F6', border: '#D1D5DB', text: '#4B5563' }
+                          : cls === 'academic'
+                          ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9' }
+                          : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8' };
+                        return (
+                          <div key={e.id} className="absolute rounded px-1 py-0.5 text-[10px] font-medium overflow-hidden z-10"
+                            style={{ top, height: height - 1, left: `calc(${leftPct}% + 2px)`, width: `calc(${widthPct}% - 4px)`, backgroundColor: colors.bg, borderLeft: `2px solid ${colors.border}`, color: colors.text }}>
+                            <div className="truncate leading-tight">{e.title}</div>
+                          </div>
+                        );
+                      });
+                    })()}
                     {/* Current time line */}
                     {dateStr === todayStr && (() => {
                       const nowMins = timeToMinutes(new Date().getHours(), new Date().getMinutes());
@@ -1259,7 +1341,7 @@
     }
 
     // ===== SETTINGS VIEW =====
-    function SettingsView({ settings, setSettings, gcalConnected, connectGCal, gcalLoading, calendarEvents, eventClassifications, setEventClassifications }) {
+    function SettingsView({ settings, setSettings, gcalConnected, connectGCal, refreshGCal, gcalLoading, calendarEvents, eventClassifications, setEventClassifications }) {
       const update = (key, value) => setSettings(prev => ({ ...prev, [key]: value }));
 
       const uniqueEvents = useMemo(() => {
@@ -1277,8 +1359,20 @@
           <section className="bg-white rounded-xl border border-gray-200 p-5">
             <h3 className="text-sm font-semibold text-gray-800 mb-4">Google Calendar</h3>
             {gcalConnected ? (
-              <div className="flex items-center gap-2 text-sm text-emerald-600 font-medium">
-                <span className="w-2 h-2 bg-emerald-500 rounded-full" /> Connected
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-sm text-emerald-600 font-medium">
+                  <span className="w-2 h-2 bg-emerald-500 rounded-full" /> Connected
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={refreshGCal} disabled={gcalLoading}
+                    className="px-3 py-1.5 text-xs font-medium border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50">
+                    {gcalLoading ? '...' : '↻ Refresh'}
+                  </button>
+                  <button onClick={connectGCal} disabled={gcalLoading}
+                    className="px-3 py-1.5 text-xs font-medium text-violet-600 border border-violet-200 rounded-lg hover:bg-violet-50 disabled:opacity-50">
+                    Reconnect
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="space-y-3">
