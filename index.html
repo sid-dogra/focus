@@ -90,7 +90,45 @@
       dangerZoneHours: 48,
       googleClientId: '',
       allowedEmails: ['dograsiddhant@gmail.com'],
+      softKeywords: ['contrast coverage'],
+      calendarRefreshMinutes: 30,
+      hiddenEventKeywords: ['radiology residency r2c2 didactic meeting'],
+      hiddenEventPrefixes: ['12pm', '8am'],
+      eventRenameRules: [{ match: '(no title)', replace: 'a2z Event' }],
     };
+
+    // Auto-classify an event based on keyword rules
+    function classifyEvent(eventTitle, settings) {
+      const title = (eventTitle || '').toLowerCase();
+      const softKeywords = (settings.softKeywords || []);
+      for (const kw of softKeywords) {
+        if (kw && title.includes(kw.toLowerCase())) return 'soft';
+      }
+      return 'hard';
+    }
+
+    // Check if an event should be hidden
+    function shouldHideEvent(eventTitle, settings) {
+      const title = (eventTitle || '').toLowerCase();
+      for (const kw of (settings.hiddenEventKeywords || [])) {
+        if (kw && title.includes(kw.toLowerCase())) return true;
+      }
+      for (const prefix of (settings.hiddenEventPrefixes || [])) {
+        if (prefix && title.startsWith(prefix.toLowerCase())) return true;
+      }
+      return false;
+    }
+
+    // Apply rename rules to an event title
+    function renameEvent(eventTitle, settings) {
+      let title = eventTitle || '';
+      for (const rule of (settings.eventRenameRules || [])) {
+        if (rule.match && title.toLowerCase().includes(rule.match.toLowerCase())) {
+          title = rule.replace;
+        }
+      }
+      return title;
+    }
 
     // ===== STORAGE =====
     const storage = {
@@ -280,7 +318,7 @@
     };
 
     // ===== SCHEDULING ENGINE =====
-    function generateSchedule(tasks, calendarEvents, date, settings, eventClassifications) {
+    function generateSchedule(tasks, calendarEvents, date, settings) {
       const d = new Date(date);
       const weekend = isWeekend(d);
       const availStart = weekend ? settings.weekendAvailableAfter : settings.weekdayAvailableAfter;
@@ -288,7 +326,7 @@
 
       // Check for academic time
       const hasAcademic = calendarEvents.some(e => {
-        const cls = eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard';
+        const cls = classifyEvent(e.title, settings);
         return cls === 'academic';
       });
 
@@ -310,7 +348,7 @@
 
         const startMins = timeToMinutes(eStart.getHours(), eStart.getMinutes());
         const endMins = timeToMinutes(eEnd.getHours(), eEnd.getMinutes());
-        const cls = eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard';
+        const cls = classifyEvent(e.title, settings);
 
         if (cls === 'soft') {
           softBlocks.push({ start: Math.max(startMins, dayStart), end: Math.min(endMins, dayEnd), event: e });
@@ -330,17 +368,24 @@
       }
       if (cursor < dayEnd) freeWindows.push({ start: cursor, end: dayEnd });
 
-      // Sort tasks into tiers
+      // Only schedule tasks assigned to this day (plus overdue/urgent deadline tasks)
+      const dateStr = d.toISOString().split('T')[0];
       const now = new Date();
       const dangerMs = settings.dangerZoneHours * 60 * 60 * 1000;
       const incompleteTasks = tasks.filter(t => t.status !== 'done');
+      const assignedToday = incompleteTasks.filter(t => t.assignedDate === dateStr);
 
+      // Also include urgent/overdue deadline tasks even if not explicitly assigned
       const urgent = incompleteTasks.filter(t => t.deadline && (new Date(t.deadline) - now) < dangerMs && (new Date(t.deadline) - now) > 0)
         .sort((a, b) => new Date(a.deadline) - new Date(b.deadline));
-
       const overdue = incompleteTasks.filter(t => t.deadline && (new Date(t.deadline) - now) <= 0);
 
-      const remaining = incompleteTasks.filter(t => !urgent.includes(t) && !overdue.includes(t));
+      // Merge: assigned today + urgent/overdue (deduplicated)
+      const assignedIds = new Set(assignedToday.map(t => t.id));
+      const extraUrgent = [...overdue, ...urgent].filter(t => !assignedIds.has(t.id));
+      const todayPool = [...assignedToday, ...extraUrgent];
+
+      const remaining = todayPool.filter(t => !urgent.includes(t) && !overdue.includes(t));
       const quick = remaining.filter(t => t.effort === 'quick').sort((a, b) => b.importance - a.importance);
       const deep = remaining.filter(t => t.effort === 'deep').sort((a, b) => {
         const aScore = a.importance * (a.deadline ? (1 + 1000 / Math.max(1, (new Date(a.deadline) - now) / 3600000)) : 1);
@@ -424,7 +469,7 @@
         const eStart = new Date(e.start);
         const eEnd = new Date(e.end);
         if (eStart.toDateString() !== d.toDateString()) return null;
-        const cls = eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard';
+        const cls = classifyEvent(e.title, settings);
         return {
           id: e.id,
           title: e.title,
@@ -557,7 +602,6 @@
     function App() {
       const [tasks, setTasks] = useState(() => storage.get('tasks', []));
       const [settings, setSettings] = useState(() => storage.get('settings', DEFAULT_SETTINGS));
-      const [eventClassifications, setEventClassifications] = useState(() => storage.get('eventClassifications', {}));
       const [view, setView] = useState('calendar');
       const [calendarMode, setCalendarMode] = useState('day'); // day, week, month
       const [showTaskModal, setShowTaskModal] = useState(false);
@@ -573,7 +617,6 @@
       // Persist
       useEffect(() => { storage.set('tasks', tasks); }, [tasks]);
       useEffect(() => { storage.set('settings', settings); }, [settings]);
-      useEffect(() => { storage.set('eventClassifications', eventClassifications); }, [eventClassifications]);
 
       // Init Google Calendar and auto-connect
       useEffect(() => {
@@ -582,13 +625,14 @@
             if (window.gapi && window.google?.accounts?.oauth2) {
               clearInterval(interval);
               GCalService.init(settings.googleClientId, () => {
-                // Auto-connect silently (no popup if previously authorized)
-                GCalService.authorize(false).then(() => {
-                  setGcalConnected(true);
-                }).catch(() => {
-                  // Silent auth failed — user will need to click Connect
-                  console.log('Auto-connect: needs manual authorization');
-                });
+                // If user previously connected, try silent re-auth
+                if (storage.get('gcal_connected', false)) {
+                  GCalService.authorize(false).then(() => {
+                    setGcalConnected(true);
+                  }).catch(() => {
+                    console.log('Auto-connect: silent auth failed, needs manual reconnect');
+                  });
+                }
               });
             }
           }, 500);
@@ -624,6 +668,8 @@
         try {
           await GCalService.authorize(true);
           setGcalConnected(true);
+          storage.set('gcal_connected', true);
+          storage.set('gcal_last_fetch', Date.now());
           notify('Google Calendar connected!');
           await fetchEvents();
         } catch (err) {
@@ -636,6 +682,7 @@
         setGcalLoading(true);
         try {
           await fetchEvents();
+          storage.set('gcal_last_fetch', Date.now());
           notify('Calendar refreshed!');
         } catch (err) {
           notify('Failed to refresh: ' + err, 'error');
@@ -658,7 +705,11 @@
             start.setDate(start.getDate() - 1);
             end.setDate(end.getDate() + 2);
           }
-          const events = await GCalService.listEvents(start, end);
+          const rawEvents = await GCalService.listEvents(start, end);
+          // Filter hidden events and apply rename rules
+          const events = rawEvents
+            .filter(e => !shouldHideEvent(e.title, settings))
+            .map(e => ({ ...e, title: renameEvent(e.title, settings) }));
           setCalendarEvents(events);
         } catch (err) {
           console.error('Fetch events error:', err);
@@ -666,12 +717,27 @@
       };
 
       useEffect(() => {
-        if (gcalConnected) fetchEvents();
+        if (gcalConnected) {
+          fetchEvents();
+          storage.set('gcal_last_fetch', Date.now());
+        }
       }, [selectedDate, gcalConnected, calendarMode]);
+
+      // Auto-refresh calendar on interval
+      useEffect(() => {
+        if (!gcalConnected) return;
+        const refreshMs = (settings.calendarRefreshMinutes || 30) * 60 * 1000;
+        const timer = setInterval(() => {
+          fetchEvents().then(() => {
+            storage.set('gcal_last_fetch', Date.now());
+          }).catch(() => {});
+        }, refreshMs);
+        return () => clearInterval(timer);
+      }, [gcalConnected, settings.calendarRefreshMinutes, calendarMode, selectedDate]);
 
       // Auto-schedule
       const runAutoSchedule = () => {
-        const result = generateSchedule(tasks, calendarEvents, selectedDate, settings, eventClassifications);
+        const result = generateSchedule(tasks, calendarEvents, selectedDate, settings);
         setSchedule(result);
         notify(`Scheduled ${result.scheduled.filter(s => s.type === 'task').length} tasks`);
       };
@@ -754,14 +820,6 @@
                   Install as App
                 </button>
               )}
-              <div className="text-xs text-gray-400 mb-2">Completed</div>
-              <div className="flex items-center gap-2">
-                <div className="flex-1 bg-gray-100 rounded-full h-2">
-                  <div className="bg-violet-500 h-2 rounded-full transition-all" style={{ width: `${stats.total ? (stats.done / stats.total * 100) : 0}%` }} />
-                </div>
-                <span className="text-xs text-gray-500 font-medium">{stats.done}/{stats.total}</span>
-              </div>
-              {stats.overdue > 0 && <div className="mt-2 text-xs text-red-500 font-medium">{stats.overdue} overdue</div>}
               {settings.googleClientId && (() => {
                 try {
                   const authUser = JSON.parse(sessionStorage.getItem('focus_auth') || 'null');
@@ -861,18 +919,17 @@
             {/* Content */}
             <div className="flex-1 overflow-y-auto p-4 md:p-6">
               {view === 'calendar' && calendarMode === 'day' && <TodayView tasks={tasks} schedule={schedule} calendarEvents={calendarEvents} selectedDate={selectedDate}
-                settings={settings} eventClassifications={eventClassifications} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }} />}
+                settings={settings} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }} />}
               {view === 'calendar' && calendarMode === 'week' && <WeekView tasks={tasks} calendarEvents={calendarEvents} selectedDate={selectedDate} settings={settings}
-                eventClassifications={eventClassifications} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
+                toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
                 onDayClick={(d) => { setSelectedDate(d); setCalendarMode('day'); }} />}
               {view === 'calendar' && calendarMode === 'month' && <MonthView tasks={tasks} calendarEvents={calendarEvents} selectedDate={selectedDate}
-                eventClassifications={eventClassifications} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
+                settings={settings} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
                 onDayClick={(d) => { setSelectedDate(d); setCalendarMode('day'); }} />}
               {view === 'tasks' && <AllTasksView tasks={tasks} toggleDone={toggleDone} deleteTask={deleteTask}
-                onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }} />}
+                updateTask={updateTask} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }} />}
               {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} gcalConnected={gcalConnected}
-                connectGCal={connectGCal} refreshGCal={refreshGCal} gcalLoading={gcalLoading} calendarEvents={calendarEvents}
-                eventClassifications={eventClassifications} setEventClassifications={setEventClassifications} />}
+                connectGCal={connectGCal} refreshGCal={refreshGCal} gcalLoading={gcalLoading} />}
             </div>
           </main>
 
@@ -891,7 +948,7 @@
     }
 
     // ===== TODAY VIEW =====
-    function TodayView({ tasks, schedule, calendarEvents, selectedDate, settings, eventClassifications, toggleDone, onEdit }) {
+    function TodayView({ tasks, schedule, calendarEvents, selectedDate, settings, toggleDone, onEdit }) {
       const incompleteTasks = tasks.filter(t => t.status !== 'done');
       const now = new Date();
       const dangerMs = settings.dangerZoneHours * 60 * 60 * 1000;
@@ -958,7 +1015,7 @@
                   id: e.id,
                   title: e.title,
                   type: 'event',
-                  classification: eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard',
+                  classification: classifyEvent(e.title, settings),
                   startMinutes: timeToMinutes(es.getHours(), es.getMinutes()),
                   endMinutes: timeToMinutes(new Date(e.end).getHours(), new Date(e.end).getMinutes()),
                   event: e,
@@ -1075,7 +1132,7 @@
     }
 
     // ===== WEEK VIEW =====
-    function WeekView({ tasks, calendarEvents, selectedDate, settings, eventClassifications, toggleDone, onEdit, onDayClick }) {
+    function WeekView({ tasks, calendarEvents, selectedDate, settings, toggleDone, onEdit, onDayClick }) {
       const weekStart = new Date(selectedDate);
       const dayOfWeek = weekStart.getDay();
       weekStart.setDate(weekStart.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
@@ -1153,7 +1210,7 @@
                         const layout = overlapLayout.get(e.id) || { col: 0, totalCols: 1 };
                         const widthPct = 100 / layout.totalCols;
                         const leftPct = layout.col * widthPct;
-                        const cls = eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard';
+                        const cls = classifyEvent(e.title, settings);
                         const colors = cls === 'soft'
                           ? { bg: '#F3F4F6', border: '#D1D5DB', text: '#4B5563' }
                           : cls === 'academic'
@@ -1182,7 +1239,7 @@
     }
 
     // ===== MONTH VIEW =====
-    function MonthView({ tasks, calendarEvents, selectedDate, eventClassifications, toggleDone, onEdit, onDayClick }) {
+    function MonthView({ tasks, calendarEvents, selectedDate, settings, toggleDone, onEdit, onDayClick }) {
       const current = new Date(selectedDate);
       const year = current.getFullYear();
       const month = current.getMonth();
@@ -1235,7 +1292,7 @@
                 });
                 const dayTasks = incompleteTasks.filter(t => t.deadline && new Date(t.deadline).toDateString() === d.toDateString());
                 const items = [...dayEvents.map(e => ({ type: 'event', title: e.title, id: e.id,
-                  cls: eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard' })),
+                  cls: classifyEvent(e.title, settings) })),
                   ...dayTasks.map(t => ({ type: 'task', title: t.title, id: t.id, task: t }))];
 
                 return (
@@ -1279,79 +1336,176 @@
     }
 
     // ===== ALL TASKS VIEW =====
-    function AllTasksView({ tasks, toggleDone, deleteTask, onEdit }) {
+    function AllTasksView({ tasks, toggleDone, deleteTask, updateTask, onEdit }) {
       const [filter, setFilter] = useState('all');
-      const [statusFilter, setStatusFilter] = useState('active');
-      const [sortBy, setSortBy] = useState('created');
 
-      let filtered = tasks;
+      const incomplete = tasks.filter(t => t.status !== 'done');
+      let filtered = incomplete;
       if (filter !== 'all') filtered = filtered.filter(t => t.category === filter);
-      if (statusFilter === 'active') filtered = filtered.filter(t => t.status !== 'done');
-      else if (statusFilter === 'done') filtered = filtered.filter(t => t.status === 'done');
 
-      if (sortBy === 'deadline') filtered = [...filtered].sort((a, b) => {
-        if (!a.deadline) return 1; if (!b.deadline) return -1;
-        return new Date(a.deadline) - new Date(b.deadline);
+      // Build week days (Mon-Sun of current week)
+      const today = new Date();
+      const todayStr = today.toISOString().split('T')[0];
+      const dow = today.getDay();
+      const monday = new Date(today);
+      monday.setDate(today.getDate() - (dow === 0 ? 6 : dow - 1));
+      const weekDays = Array.from({ length: 7 }, (_, i) => {
+        const d = new Date(monday);
+        d.setDate(monday.getDate() + i);
+        return d;
       });
-      else if (sortBy === 'importance') filtered = [...filtered].sort((a, b) => b.importance - a.importance);
-      else filtered = [...filtered].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+      const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+      // Group tasks by day
+      const tasksByDay = {};
+      weekDays.forEach(d => { tasksByDay[d.toISOString().split('T')[0]] = []; });
+      const unassigned = [];
+      const overdue = []; // assigned to past day and not done
+
+      filtered.forEach(t => {
+        if (!t.assignedDate) {
+          unassigned.push(t);
+        } else if (tasksByDay[t.assignedDate] !== undefined) {
+          tasksByDay[t.assignedDate].push(t);
+        } else if (new Date(t.assignedDate) < new Date(todayStr)) {
+          overdue.push(t);
+        } else {
+          unassigned.push(t);
+        }
+      });
+
+      // Quick-assign helper
+      const assignToDay = (taskId, dateStr) => {
+        updateTask(taskId, { assignedDate: dateStr || null });
+      };
 
       return (
         <div className="fade-in space-y-4">
-          {/* Filters */}
-          <div className="flex flex-wrap gap-2">
-            <div className="flex bg-white rounded-lg border border-gray-200 p-0.5">
-              {['all', ...Object.keys(CATEGORIES)].map(c => (
-                <button key={c} onClick={() => setFilter(c)}
-                  className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${filter === c ? 'bg-gray-900 text-white' : 'text-gray-500 hover:text-gray-700'}`}>
-                  {c === 'all' ? 'All' : CATEGORIES[c].label}
-                </button>
-              ))}
-            </div>
-            <div className="flex bg-white rounded-lg border border-gray-200 p-0.5">
-              {[['active', 'Active'], ['done', 'Done'], ['all', 'All']].map(([k, l]) => (
-                <button key={k} onClick={() => setStatusFilter(k)}
-                  className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${statusFilter === k ? 'bg-gray-900 text-white' : 'text-gray-500 hover:text-gray-700'}`}>
-                  {l}
-                </button>
-              ))}
-            </div>
-            <select value={sortBy} onChange={e => setSortBy(e.target.value)}
-              className="px-3 py-1 text-xs font-medium bg-white border border-gray-200 rounded-lg text-gray-600">
-              <option value="created">Newest first</option>
-              <option value="deadline">By deadline</option>
-              <option value="importance">By importance</option>
-            </select>
+          {/* Category filter */}
+          <div className="flex bg-white rounded-lg border border-gray-200 p-0.5 w-fit">
+            {['all', ...Object.keys(CATEGORIES)].map(c => (
+              <button key={c} onClick={() => setFilter(c)}
+                className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${filter === c ? 'bg-gray-900 text-white' : 'text-gray-500 hover:text-gray-700'}`}>
+                {c === 'all' ? 'All' : CATEGORIES[c].label}
+              </button>
+            ))}
           </div>
 
-          {/* Task list */}
-          <div className="space-y-2">
-            {filtered.map(t => (
-              <TaskCard key={t.id} task={t} toggleDone={toggleDone} deleteTask={deleteTask} onEdit={onEdit} />
-            ))}
-            {filtered.length === 0 && (
-              <div className="text-center py-12 text-gray-400">
-                <div className="text-4xl mb-2">✨</div>
-                <div className="text-sm">No tasks here. Add one to get started!</div>
+          {/* Overdue (assigned to past days) */}
+          {overdue.length > 0 && (
+            <div className="bg-red-50 rounded-xl border border-red-200 p-4">
+              <h3 className="text-xs font-semibold text-red-600 mb-2 uppercase tracking-wide">Missed — Reassign these</h3>
+              <div className="space-y-2">
+                {overdue.map(t => (
+                  <PlannerTaskCard key={t.id} task={t} weekDays={weekDays} dayLabels={dayLabels} todayStr={todayStr}
+                    toggleDone={toggleDone} deleteTask={deleteTask} onEdit={onEdit} assignToDay={assignToDay} />
+                ))}
               </div>
+            </div>
+          )}
+
+          {/* Week days */}
+          {weekDays.map((d, i) => {
+            const dateStr = d.toISOString().split('T')[0];
+            const isToday = dateStr === todayStr;
+            const isPast = d < new Date(todayStr);
+            const dayTasks = tasksByDay[dateStr] || [];
+            if (isPast && !isToday && dayTasks.length === 0) return null;
+
+            return (
+              <div key={dateStr} className={`rounded-xl border p-4 ${isToday ? 'bg-violet-50 border-violet-200' : 'bg-white border-gray-200'}`}>
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className={`text-sm font-semibold ${isToday ? 'text-violet-700' : isPast ? 'text-gray-400' : 'text-gray-700'}`}>
+                    {dayLabels[i]} {d.getDate()}{isToday ? ' — Today' : ''}
+                  </h3>
+                  {dayTasks.length > 0 && (
+                    <span className="text-[10px] text-gray-400 font-medium">
+                      {dayTasks.reduce((sum, t) => sum + (t.customMinutes || EFFORT[t.effort].minutes), 0)}m total
+                    </span>
+                  )}
+                </div>
+                {dayTasks.length > 0 ? (
+                  <div className="space-y-2">
+                    {dayTasks.map(t => (
+                      <PlannerTaskCard key={t.id} task={t} weekDays={weekDays} dayLabels={dayLabels} todayStr={todayStr}
+                        toggleDone={toggleDone} deleteTask={deleteTask} onEdit={onEdit} assignToDay={assignToDay} />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-xs text-gray-300 italic">No tasks assigned</div>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Unassigned */}
+          <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50/50 p-4">
+            <h3 className="text-sm font-semibold text-gray-500 mb-2">Unassigned</h3>
+            {unassigned.length > 0 ? (
+              <div className="space-y-2">
+                {unassigned.map(t => (
+                  <PlannerTaskCard key={t.id} task={t} weekDays={weekDays} dayLabels={dayLabels} todayStr={todayStr}
+                    toggleDone={toggleDone} deleteTask={deleteTask} onEdit={onEdit} assignToDay={assignToDay} />
+                ))}
+              </div>
+            ) : (
+              <div className="text-xs text-gray-300 italic">All tasks are assigned to a day</div>
             )}
           </div>
         </div>
       );
     }
 
-    // ===== SETTINGS VIEW =====
-    function SettingsView({ settings, setSettings, gcalConnected, connectGCal, refreshGCal, gcalLoading, calendarEvents, eventClassifications, setEventClassifications }) {
-      const update = (key, value) => setSettings(prev => ({ ...prev, [key]: value }));
+    // ===== PLANNER TASK CARD =====
+    function PlannerTaskCard({ task, weekDays, dayLabels, todayStr, toggleDone, deleteTask, onEdit, assignToDay }) {
+      const cat = CATEGORIES[task.category];
+      const eff = EFFORT[task.effort];
+      const mins = task.customMinutes || eff.minutes;
+      const timeLabel = mins >= 60 ? `${Math.floor(mins / 60)}h${mins % 60 > 0 ? ` ${mins % 60}m` : ''}` : `${mins}m`;
 
-      const uniqueEvents = useMemo(() => {
-        const seen = new Set();
-        return calendarEvents.filter(e => {
-          if (seen.has(e.title)) return false;
-          seen.add(e.title);
-          return true;
-        });
-      }, [calendarEvents]);
+      return (
+        <div className="task-card bg-white rounded-lg border border-gray-200 p-3 flex items-start gap-3">
+          <button onClick={() => toggleDone(task.id)}
+            className="mt-0.5 w-4 h-4 rounded-full border-2 border-gray-300 hover:border-violet-400 flex-shrink-0 transition-colors" />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 mb-1">
+              <div className="category-dot" style={{ backgroundColor: cat.color }} />
+              <span className="text-sm font-medium text-gray-900 truncate cursor-pointer hover:text-violet-600" onClick={() => onEdit(task)}>{task.title}</span>
+              {task.link && (
+                <a href={task.link} target="_blank" rel="noopener noreferrer"
+                  className="text-violet-400 hover:text-violet-600 flex-shrink-0">
+                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M5 1H2a1 1 0 00-1 1v8a1 1 0 001 1h8a1 1 0 001-1V7M7 1h4m0 0v4m0-4L5.5 6.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                </a>
+              )}
+              <span className="text-[10px] text-gray-400 ml-auto flex-shrink-0">{eff.icon} {timeLabel}</span>
+            </div>
+            {/* Quick day assign */}
+            <div className="flex items-center gap-0.5 mt-1">
+              {weekDays.map((d, i) => {
+                const dateStr = d.toISOString().split('T')[0];
+                const isAssigned = task.assignedDate === dateStr;
+                const isPast = d < new Date(todayStr) && dateStr !== todayStr;
+                return (
+                  <button key={dateStr} onClick={() => assignToDay(task.id, isAssigned ? null : dateStr)}
+                    className={`w-6 h-5 text-[9px] font-semibold rounded transition-colors ${isAssigned ? 'bg-violet-600 text-white' : isPast ? 'bg-gray-50 text-gray-300' : 'bg-gray-100 text-gray-500 hover:bg-violet-100 hover:text-violet-600'}`}>
+                    {dayLabels[i].charAt(0)}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <button onClick={() => deleteTask(task.id)}
+            className="text-gray-200 hover:text-red-400 transition-colors flex-shrink-0 p-0.5 mt-0.5">
+            <svg width="12" height="12" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5"/></svg>
+          </button>
+        </div>
+      );
+    }
+
+    // ===== SETTINGS VIEW =====
+    function SettingsView({ settings, setSettings, gcalConnected, connectGCal, refreshGCal, gcalLoading }) {
+      const update = (key, value) => setSettings(prev => ({ ...prev, [key]: value }));
 
       return (
         <div className="fade-in space-y-6 max-w-2xl">
@@ -1429,30 +1583,107 @@
             </div>
           </section>
 
-          {/* Event Classifications */}
-          {uniqueEvents.length > 0 && (
-            <section className="bg-white rounded-xl border border-gray-200 p-5">
-              <h3 className="text-sm font-semibold text-gray-800 mb-1">Event Classifications</h3>
-              <p className="text-xs text-gray-500 mb-4">Tell Focus which events are real commitments vs. flexible time.</p>
-              <div className="space-y-2">
-                {uniqueEvents.map(e => {
-                  const cls = eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard';
-                  return (
-                    <div key={e.id} className="flex items-center justify-between gap-3 py-2 border-b border-gray-50 last:border-0">
-                      <span className="text-sm text-gray-700 truncate flex-1">{e.title}</span>
-                      <select value={cls} onChange={ev => {
-                        setEventClassifications(prev => ({ ...prev, [e.id]: ev.target.value, [e.title.toLowerCase()]: ev.target.value }));
-                      }} className="px-2 py-1 text-xs border border-gray-200 rounded-lg bg-white">
-                        <option value="hard">Hard block</option>
-                        <option value="soft">Soft (available)</option>
-                        <option value="academic">Academic time</option>
-                      </select>
+          {/* Soft Coverage Keywords */}
+          <section className="bg-white rounded-xl border border-gray-200 p-5">
+            <h3 className="text-sm font-semibold text-gray-800 mb-1">Soft Coverage Keywords</h3>
+            <p className="text-xs text-gray-500 mb-3">Events whose name contains any of these keywords are treated as soft blocks — Focus can suggest quick tasks during them.</p>
+            <div className="space-y-2">
+              {(settings.softKeywords || []).map((kw, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <input type="text" value={kw} onChange={e => {
+                    const updated = [...(settings.softKeywords || [])];
+                    updated[i] = e.target.value;
+                    update('softKeywords', updated);
+                  }} placeholder="e.g. contrast coverage"
+                    className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                  <button type="button" onClick={() => {
+                    update('softKeywords', (settings.softKeywords || []).filter((_, j) => j !== i));
+                  }} className="text-gray-300 hover:text-red-400 p-1">
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5"/></svg>
+                  </button>
+                </div>
+              ))}
+              <button type="button" onClick={() => update('softKeywords', [...(settings.softKeywords || []), ''])}
+                className="text-xs text-violet-600 hover:text-violet-700 font-medium">+ Add keyword</button>
+            </div>
+          </section>
+
+          {/* Hidden Events */}
+          <section className="bg-white rounded-xl border border-gray-200 p-5">
+            <h3 className="text-sm font-semibold text-gray-800 mb-1">Hidden Events</h3>
+            <p className="text-xs text-gray-500 mb-3">Events matching these keywords or starting with these prefixes won't appear in Focus.</p>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-1">Contains keyword</label>
+                <div className="space-y-1">
+                  {(settings.hiddenEventKeywords || []).map((kw, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <input type="text" value={kw} onChange={e => {
+                        const updated = [...(settings.hiddenEventKeywords || [])];
+                        updated[i] = e.target.value;
+                        update('hiddenEventKeywords', updated);
+                      }} className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                      <button type="button" onClick={() => update('hiddenEventKeywords', (settings.hiddenEventKeywords || []).filter((_, j) => j !== i))}
+                        className="text-gray-300 hover:text-red-400 p-1">
+                        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5"/></svg>
+                      </button>
                     </div>
-                  );
-                })}
+                  ))}
+                  <button type="button" onClick={() => update('hiddenEventKeywords', [...(settings.hiddenEventKeywords || []), ''])}
+                    className="text-xs text-violet-600 hover:text-violet-700 font-medium">+ Add keyword</button>
+                </div>
               </div>
-            </section>
-          )}
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-1">Starts with</label>
+                <div className="space-y-1">
+                  {(settings.hiddenEventPrefixes || []).map((prefix, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <input type="text" value={prefix} onChange={e => {
+                        const updated = [...(settings.hiddenEventPrefixes || [])];
+                        updated[i] = e.target.value;
+                        update('hiddenEventPrefixes', updated);
+                      }} className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                      <button type="button" onClick={() => update('hiddenEventPrefixes', (settings.hiddenEventPrefixes || []).filter((_, j) => j !== i))}
+                        className="text-gray-300 hover:text-red-400 p-1">
+                        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5"/></svg>
+                      </button>
+                    </div>
+                  ))}
+                  <button type="button" onClick={() => update('hiddenEventPrefixes', [...(settings.hiddenEventPrefixes || []), ''])}
+                    className="text-xs text-violet-600 hover:text-violet-700 font-medium">+ Add prefix</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* Event Rename Rules */}
+          <section className="bg-white rounded-xl border border-gray-200 p-5">
+            <h3 className="text-sm font-semibold text-gray-800 mb-1">Event Rename Rules</h3>
+            <p className="text-xs text-gray-500 mb-3">Rename events that match a keyword.</p>
+            <div className="space-y-2">
+              {(settings.eventRenameRules || []).map((rule, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <input type="text" value={rule.match} onChange={e => {
+                    const updated = [...(settings.eventRenameRules || [])];
+                    updated[i] = { ...updated[i], match: e.target.value };
+                    update('eventRenameRules', updated);
+                  }} placeholder="Contains..." className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                  <span className="text-xs text-gray-400">→</span>
+                  <input type="text" value={rule.replace} onChange={e => {
+                    const updated = [...(settings.eventRenameRules || [])];
+                    updated[i] = { ...updated[i], replace: e.target.value };
+                    update('eventRenameRules', updated);
+                  }} placeholder="Rename to..." className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                  <button type="button" onClick={() => update('eventRenameRules', (settings.eventRenameRules || []).filter((_, j) => j !== i))}
+                    className="text-gray-300 hover:text-red-400 p-1">
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5"/></svg>
+                  </button>
+                </div>
+              ))}
+              <button type="button" onClick={() => update('eventRenameRules', [...(settings.eventRenameRules || []), { match: '', replace: '' }])}
+                className="text-xs text-violet-600 hover:text-violet-700 font-medium">+ Add rule</button>
+            </div>
+          </section>
 
           {/* Schedule Preferences */}
           <section className="bg-white rounded-xl border border-gray-200 p-5">
@@ -1500,6 +1731,14 @@
                   className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg" min="1" max="168" />
                 <p className="text-xs text-gray-400 mt-1">Tasks due within this window get top priority</p>
               </div>
+              <div className="col-span-2">
+                <label className="block text-xs font-medium text-gray-600 mb-1">Auto-refresh calendar every</label>
+                <div className="flex items-center gap-2">
+                  <input type="number" value={settings.calendarRefreshMinutes || 30} onChange={e => update('calendarRefreshMinutes', Number(e.target.value))}
+                    className="w-24 px-3 py-2 text-sm border border-gray-200 rounded-lg" min="5" max="120" />
+                  <span className="text-xs text-gray-400">minutes</span>
+                </div>
+              </div>
             </div>
           </section>
 
@@ -1508,7 +1747,7 @@
             <h3 className="text-sm font-semibold text-gray-800 mb-4">Data</h3>
             <div className="flex gap-2">
               <button onClick={() => {
-                const data = JSON.stringify({ tasks: storage.get('tasks', []), settings: storage.get('settings', DEFAULT_SETTINGS), eventClassifications: storage.get('eventClassifications', {}) }, null, 2);
+                const data = JSON.stringify({ tasks: storage.get('tasks', []), settings: storage.get('settings', DEFAULT_SETTINGS) }, null, 2);
                 const blob = new Blob([data], { type: 'application/json' });
                 const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'focus-backup.json'; a.click();
               }} className="px-3 py-1.5 text-sm font-medium border border-gray-200 rounded-lg hover:bg-gray-50">
@@ -1524,7 +1763,6 @@
                       const data = JSON.parse(ev.target.result);
                       if (data.tasks) storage.set('tasks', data.tasks);
                       if (data.settings) storage.set('settings', data.settings);
-                      if (data.eventClassifications) storage.set('eventClassifications', data.eventClassifications);
                       window.location.reload();
                     } catch { alert('Invalid backup file'); }
                   };
@@ -1547,6 +1785,7 @@
       const [importance, setImportance] = useState(task?.importance || 2);
       const [hasDeadline, setHasDeadline] = useState(!!task?.deadline);
       const [deadline, setDeadline] = useState(task?.deadline ? new Date(task.deadline).toISOString().slice(0, 16) : '');
+      const [assignedDate, setAssignedDate] = useState(task?.assignedDate || '');
       const [link, setLink] = useState(task?.link || '');
 
       const handleSubmit = (e) => {
@@ -1556,6 +1795,7 @@
           title: title.trim(), notes, category, effort, importance,
           customMinutes: customMinutes ? Number(customMinutes) : null,
           deadline: hasDeadline && deadline ? new Date(deadline).toISOString() : null,
+          assignedDate: assignedDate || null,
           link: link.trim() || null,
         });
       };
@@ -1619,6 +1859,41 @@
                       {'★'.repeat(p.v)} {p.label}
                     </button>
                   ))}
+                </div>
+              </div>
+
+              {/* Assigned Day */}
+              <div className="mb-4">
+                <label className="block text-xs font-medium text-gray-500 mb-2">Assigned day</label>
+                <div className="flex items-center gap-1">
+                  {(() => {
+                    const today = new Date();
+                    const dow = today.getDay();
+                    const monday = new Date(today);
+                    monday.setDate(today.getDate() - (dow === 0 ? 6 : dow - 1));
+                    const days = Array.from({ length: 7 }, (_, i) => {
+                      const d = new Date(monday);
+                      d.setDate(monday.getDate() + i);
+                      return d;
+                    });
+                    return days.map(d => {
+                      const dateStr = d.toISOString().split('T')[0];
+                      const dayLabel = d.toLocaleDateString('en-US', { weekday: 'short' }).charAt(0);
+                      const isSelected = assignedDate === dateStr;
+                      const isPast = d < new Date(new Date().toDateString());
+                      return (
+                        <button key={dateStr} type="button" onClick={() => setAssignedDate(isSelected ? '' : dateStr)}
+                          className={`w-9 h-9 text-xs font-semibold rounded-lg transition-colors ${isSelected ? 'bg-violet-600 text-white' : isPast ? 'bg-gray-50 text-gray-300' : 'bg-gray-50 text-gray-600 hover:bg-gray-100'}`}>
+                          <div className="text-[10px] leading-tight">{dayLabel}</div>
+                          <div className="text-[10px] leading-tight">{d.getDate()}</div>
+                        </button>
+                      );
+                    });
+                  })()}
+                  <button type="button" onClick={() => setAssignedDate('')}
+                    className={`ml-1 px-2 h-9 text-[10px] font-medium rounded-lg transition-colors ${!assignedDate ? 'bg-gray-200 text-gray-700' : 'bg-gray-50 text-gray-400 hover:bg-gray-100'}`}>
+                    None
+                  </button>
                 </div>
               </div>
 
