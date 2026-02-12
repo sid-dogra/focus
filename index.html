@@ -225,6 +225,7 @@
           gapi.load('client', async () => {
             await gapi.client.init({});
             await gapi.client.load('https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest');
+            await gapi.client.load('https://www.googleapis.com/discovery/v1/apis/drive/v3/rest');
             this._gapiReady = true;
             checkReady();
           });
@@ -233,7 +234,7 @@
         if (window.google?.accounts?.oauth2) {
           this._tokenClient = google.accounts.oauth2.initTokenClient({
             client_id: clientId,
-            scope: 'https://www.googleapis.com/auth/calendar',
+            scope: 'https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/drive.appdata',
             callback: (resp) => {
               if (resp.access_token) {
                 this._accessToken = resp.access_token;
@@ -315,6 +316,70 @@
       async deleteTimeBlock(eventId) {
         if (!this._accessToken) return;
         await gapi.client.calendar.events.delete({ calendarId: 'primary', eventId });
+      },
+    };
+
+    // ===== DRIVE SYNC =====
+    const DriveSync = {
+      _fileId: null,
+      _fileName: 'focus-app-data.json',
+
+      async _findFile() {
+        if (this._fileId) return this._fileId;
+        try {
+          const resp = await gapi.client.drive.files.list({
+            spaces: 'appDataFolder',
+            q: `name = '${this._fileName}'`,
+            fields: 'files(id, name, modifiedTime)',
+            pageSize: 1,
+          });
+          if (resp.result.files && resp.result.files.length > 0) {
+            this._fileId = resp.result.files[0].id;
+            return this._fileId;
+          }
+        } catch (err) { console.warn('DriveSync: findFile error', err); }
+        return null;
+      },
+
+      async load() {
+        try {
+          const fileId = await this._findFile();
+          if (!fileId) return null;
+          const resp = await gapi.client.drive.files.get({ fileId, alt: 'media' });
+          return resp.result;
+        } catch (err) { console.warn('DriveSync: load error', err); return null; }
+      },
+
+      async save(data) {
+        try {
+          const body = JSON.stringify(data);
+          const fileId = await this._findFile();
+          if (fileId) {
+            // Update existing
+            await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+              method: 'PATCH',
+              headers: {
+                'Authorization': `Bearer ${gapi.client.getToken().access_token}`,
+                'Content-Type': 'application/json',
+              },
+              body,
+            });
+          } else {
+            // Create new file in appDataFolder
+            const metadata = { name: this._fileName, parents: ['appDataFolder'] };
+            const form = new FormData();
+            form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+            form.append('file', new Blob([body], { type: 'application/json' }));
+            const resp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${gapi.client.getToken().access_token}` },
+              body: form,
+            });
+            const result = await resp.json();
+            this._fileId = result.id;
+          }
+          return true;
+        } catch (err) { console.warn('DriveSync: save error', err); return false; }
       },
     };
 
@@ -634,10 +699,32 @@
       const [eventPopover, setEventPopover] = useState(null); // { event, x, y }
       const [dragState, setDragState] = useState(null); // { startMinutes, currentMinutes }
       const [showSlotPicker, setShowSlotPicker] = useState(null); // { startMinutes, endMinutes }
+      const [syncStatus, setSyncStatus] = useState(null); // null | 'syncing' | 'synced' | 'error'
+      const syncTimer = useRef(null);
+      const initialSyncDone = useRef(false);
 
-      // Persist
+      // Persist locally
       useEffect(() => { storage.set('tasks', tasks); }, [tasks]);
       useEffect(() => { storage.set('settings', settings); }, [settings]);
+
+      // Save to Drive (debounced)
+      const saveToDrive = useCallback(() => {
+        if (!gcalConnected || !initialSyncDone.current) return;
+        if (syncTimer.current) clearTimeout(syncTimer.current);
+        syncTimer.current = setTimeout(async () => {
+          setSyncStatus('syncing');
+          const ok = await DriveSync.save({
+            tasks: storage.get('tasks', []),
+            settings: storage.get('settings', DEFAULT_SETTINGS),
+            lastModified: Date.now(),
+          });
+          setSyncStatus(ok ? 'synced' : 'error');
+          if (ok) setTimeout(() => setSyncStatus(null), 2000);
+        }, 2000);
+      }, [gcalConnected]);
+
+      // Sync to Drive when tasks or settings change
+      useEffect(() => { saveToDrive(); }, [tasks, settings, saveToDrive]);
 
       // Init Google Calendar and auto-connect
       useEffect(() => {
@@ -648,16 +735,46 @@
               GCalService.init(settings.googleClientId, () => {
                 // If user previously connected, try silent re-auth
                 if (storage.get('gcal_connected', false)) {
-                  GCalService.authorize(false).then(() => {
+                  GCalService.authorize(false).then(async () => {
                     setGcalConnected(true);
+                    // Load from Drive and merge
+                    try {
+                      setSyncStatus('syncing');
+                      const remote = await DriveSync.load();
+                      if (remote && remote.lastModified) {
+                        const localTasks = storage.get('tasks', []);
+                        const localModified = storage.get('lastSyncTime', 0);
+                        if (remote.lastModified > localModified) {
+                          // Remote is newer — use remote data but keep any purely-local new tasks
+                          const remoteIds = new Set((remote.tasks || []).map(t => t.id));
+                          const localOnly = localTasks.filter(t => !remoteIds.has(t.id) && new Date(t.createdAt).getTime() > localModified);
+                          const merged = [...(remote.tasks || []), ...localOnly];
+                          setTasks(merged);
+                          if (remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
+                        }
+                        storage.set('lastSyncTime', Date.now());
+                      }
+                      initialSyncDone.current = true;
+                      setSyncStatus('synced');
+                      setTimeout(() => setSyncStatus(null), 2000);
+                    } catch (err) {
+                      console.warn('Drive sync load failed', err);
+                      initialSyncDone.current = true;
+                      setSyncStatus(null);
+                    }
                   }).catch(() => {
                     console.log('Auto-connect: silent auth failed, needs manual reconnect');
+                    initialSyncDone.current = true;
                   });
+                } else {
+                  initialSyncDone.current = true;
                 }
               });
             }
           }, 500);
           return () => clearInterval(interval);
+        } else {
+          initialSyncDone.current = true;
         }
       }, [settings.googleClientId]);
 
@@ -693,6 +810,22 @@
           storage.set('gcal_last_fetch', Date.now());
           notify('Google Calendar connected!');
           await fetchEvents();
+          // Load from Drive on first manual connect
+          if (!initialSyncDone.current) {
+            try {
+              const remote = await DriveSync.load();
+              if (remote && remote.tasks && remote.tasks.length > 0) {
+                const localTasks = storage.get('tasks', []);
+                const remoteIds = new Set(remote.tasks.map(t => t.id));
+                const localOnly = localTasks.filter(t => !remoteIds.has(t.id));
+                setTasks([...remote.tasks, ...localOnly]);
+                if (remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
+                notify('Synced data from cloud');
+              }
+              storage.set('lastSyncTime', Date.now());
+            } catch (err) { console.warn('Drive sync on connect failed', err); }
+            initialSyncDone.current = true;
+          }
         } catch (err) {
           notify('Failed to connect: ' + err, 'error');
         }
@@ -958,6 +1091,11 @@
                       </>
                     )}
                   </>
+                )}
+                {syncStatus && (
+                  <span className={`text-[10px] font-medium px-2 py-1 rounded-full ${syncStatus === 'syncing' ? 'text-gray-400 bg-gray-100' : syncStatus === 'synced' ? 'text-green-600 bg-green-50' : 'text-red-500 bg-red-50'}`}>
+                    {syncStatus === 'syncing' ? 'Syncing...' : syncStatus === 'synced' ? 'Synced' : 'Sync error'}
+                  </span>
                 )}
                 <button onClick={() => { setEditingTask(null); setShowTaskModal(true); }}
                   className="px-3 py-1.5 text-sm font-medium bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors">
