@@ -743,6 +743,16 @@
         notify(`Scheduled ${result.scheduled.filter(s => s.type === 'task').length} tasks`);
       };
 
+      // Cancel a task from the schedule
+      const cancelScheduledTask = (taskId) => {
+        if (!schedule) return;
+        setSchedule(prev => ({
+          ...prev,
+          scheduled: prev.scheduled.filter(s => !(s.type === 'task' && s.task && s.task.id === taskId) && !(s.type === 'soft-suggestion' && s.task && s.task.id === taskId)),
+        }));
+        notify('Task removed from schedule');
+      };
+
       // Push to Google Calendar
       const pushToGCal = async () => {
         if (!gcalConnected || !schedule) return;
@@ -921,7 +931,8 @@
             <div className="flex-1 overflow-y-auto p-4 md:p-6">
               {view === 'calendar' && calendarMode === 'day' && <TodayView tasks={tasks} schedule={schedule} calendarEvents={calendarEvents} selectedDate={selectedDate}
                 settings={settings} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
-                onEventClick={(block, ev) => setEventPopover({ event: block, x: ev.clientX, y: ev.clientY })} />}
+                onEventClick={(block, ev) => setEventPopover({ event: block, x: ev.clientX, y: ev.clientY })}
+                onCancelScheduled={cancelScheduledTask} />}
               {view === 'calendar' && calendarMode === 'week' && <WeekView tasks={tasks} calendarEvents={calendarEvents} selectedDate={selectedDate} settings={settings}
                 toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
                 onDayClick={(d) => { setSelectedDate(d); setCalendarMode('day'); }}
@@ -986,7 +997,7 @@
     }
 
     // ===== TODAY VIEW =====
-    function TodayView({ tasks, schedule, calendarEvents, selectedDate, settings, toggleDone, onEdit, onEventClick }) {
+    function TodayView({ tasks, schedule, calendarEvents, selectedDate, settings, toggleDone, onEdit, onEventClick, onCancelScheduled }) {
       const incompleteTasks = tasks.filter(t => t.status !== 'done');
       const now = new Date();
       const dangerMs = settings.dangerZoneHours * 60 * 60 * 1000;
@@ -1123,10 +1134,17 @@
                           const cat = CATEGORIES[block.task.category];
                           const dur = block.endMinutes - block.startMinutes;
                           return (
-                            <div key={block.id} className="absolute rounded-md px-2 py-1 text-xs font-medium overflow-hidden cursor-pointer hover:opacity-80 z-10"
+                            <div key={block.id} className="absolute rounded-md px-2 py-1 text-xs font-medium overflow-hidden cursor-pointer hover:opacity-80 z-10 group"
                               style={{ top, height: height - 2, left: `calc(${leftPct}% + 4px)`, width: `calc(${widthPct}% - 8px)`, backgroundColor: cat.light, borderLeft: `3px solid ${cat.color}` }}
                               onClick={() => onEdit(block.task)}>
-                              <div className="truncate">{block.task.title}</div>
+                              <div className="flex items-start justify-between">
+                                <div className="truncate flex-1">{block.task.title}</div>
+                                {schedule && onCancelScheduled && (
+                                  <button className="opacity-0 group-hover:opacity-100 ml-1 -mr-1 -mt-0.5 w-4 h-4 flex items-center justify-center rounded-full hover:bg-black/10 text-gray-500 hover:text-gray-700 transition-opacity text-sm leading-none"
+                                    onClick={(ev) => { ev.stopPropagation(); onCancelScheduled(block.task.id); }}
+                                    title="Remove from schedule">&times;</button>
+                                )}
+                              </div>
                               {height > 30 && <div className="text-[10px] opacity-60">{dur}m · {fmt.timeShort(Math.floor(block.startMinutes/60), block.startMinutes%60)}</div>}
                               {block.type === 'soft-suggestion' && <span className="text-[10px] opacity-50">💡</span>}
                             </div>
