@@ -155,6 +155,7 @@
     const timeToMinutes = (h, m = 0) => h * 60 + m;
     const minutesToTime = (mins) => ({ h: Math.floor(mins / 60), m: mins % 60 });
     const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const snapTo15 = (mins) => Math.round(mins / 15) * 15;
 
     // ===== OVERLAP LAYOUT =====
     // Groups overlapping items and assigns column/totalColumns so they render side-by-side
@@ -357,6 +358,24 @@
         }
       });
 
+      // Treat manually-placed tasks as fixed blocks
+      const dateStr = d.toISOString().split('T')[0];
+      const manuallyPlaced = tasks.filter(t => t.status !== 'done' && t.scheduledDate === dateStr && t.scheduledStart != null && t.scheduledEnd != null);
+      const manualIds = new Set(manuallyPlaced.map(t => t.id));
+      const manualScheduled = [];
+      manuallyPlaced.forEach(t => {
+        hardBlocks.push({ start: Math.max(t.scheduledStart, dayStart), end: Math.min(t.scheduledEnd, dayEnd) });
+        manualScheduled.push({
+          id: `manual-${t.id}`,
+          taskId: t.id,
+          task: t,
+          startMinutes: t.scheduledStart,
+          endMinutes: t.scheduledEnd,
+          type: 'task',
+          manual: true,
+        });
+      });
+
       hardBlocks.sort((a, b) => a.start - b.start);
 
       // Calculate free windows (excluding hard blocks)
@@ -369,16 +388,15 @@
       if (cursor < dayEnd) freeWindows.push({ start: cursor, end: dayEnd });
 
       // Only schedule tasks assigned to this day (plus overdue/urgent deadline tasks)
-      const dateStr = d.toISOString().split('T')[0];
       const now = new Date();
       const dangerMs = settings.dangerZoneHours * 60 * 60 * 1000;
       const incompleteTasks = tasks.filter(t => t.status !== 'done');
-      const assignedToday = incompleteTasks.filter(t => t.assignedDate === dateStr);
+      const assignedToday = incompleteTasks.filter(t => t.assignedDate === dateStr && !manualIds.has(t.id));
 
-      // Also include urgent/overdue deadline tasks even if not explicitly assigned
-      const urgent = incompleteTasks.filter(t => t.deadline && (new Date(t.deadline) - now) < dangerMs && (new Date(t.deadline) - now) > 0)
+      // Also include urgent/overdue deadline tasks even if not explicitly assigned (exclude manually placed)
+      const urgent = incompleteTasks.filter(t => !manualIds.has(t.id) && t.deadline && (new Date(t.deadline) - now) < dangerMs && (new Date(t.deadline) - now) > 0)
         .sort((a, b) => new Date(a.deadline) - new Date(b.deadline));
-      const overdue = incompleteTasks.filter(t => t.deadline && (new Date(t.deadline) - now) <= 0);
+      const overdue = incompleteTasks.filter(t => !manualIds.has(t.id) && t.deadline && (new Date(t.deadline) - now) <= 0);
 
       // Merge: assigned today + urgent/overdue (deduplicated)
       const assignedIds = new Set(assignedToday.map(t => t.id));
@@ -481,7 +499,7 @@
         };
       }).filter(Boolean);
 
-      return { scheduled: [...scheduled, ...eventBlocks].sort((a, b) => a.startMinutes - b.startMinutes), freeWindows, overdue, urgent };
+      return { scheduled: [...scheduled, ...manualScheduled, ...eventBlocks].sort((a, b) => a.startMinutes - b.startMinutes), freeWindows, overdue, urgent };
     }
 
     // ===== AUTH GATE =====
@@ -614,6 +632,8 @@
       const [schedule, setSchedule] = useState(null);
       const [notification, setNotification] = useState(null);
       const [eventPopover, setEventPopover] = useState(null); // { event, x, y }
+      const [dragState, setDragState] = useState(null); // { startMinutes, currentMinutes }
+      const [showSlotPicker, setShowSlotPicker] = useState(null); // { startMinutes, endMinutes }
 
       // Persist
       useEffect(() => { storage.set('tasks', tasks); }, [tasks]);
@@ -751,6 +771,25 @@
           scheduled: prev.scheduled.filter(s => !(s.type === 'task' && s.task && s.task.id === taskId) && !(s.type === 'soft-suggestion' && s.task && s.task.id === taskId)),
         }));
         notify('Task removed from schedule');
+      };
+
+      // Assign existing task to a time slot
+      const assignTaskToSlot = (taskId, startMins, endMins) => {
+        const dateStr = new Date(selectedDate).toISOString().split('T')[0];
+        updateTask(taskId, { scheduledStart: startMins, scheduledEnd: endMins, scheduledDate: dateStr, assignedDate: dateStr });
+        setShowSlotPicker(null);
+        notify('Task placed on calendar');
+      };
+
+      // Open TaskModal pre-filled for a new task from drag
+      const createTaskFromSlot = (startMins, endMins) => {
+        const dur = endMins - startMins;
+        const dateStr = new Date(selectedDate).toISOString().split('T')[0];
+        setEditingTask(null);
+        setShowSlotPicker(null);
+        setShowTaskModal(true);
+        // Store slot info for TaskModal to pick up
+        setDragState({ slotStart: startMins, slotEnd: endMins, slotDate: dateStr, slotDuration: dur });
       };
 
       // Push to Google Calendar
@@ -932,7 +971,14 @@
               {view === 'calendar' && calendarMode === 'day' && <TodayView tasks={tasks} schedule={schedule} calendarEvents={calendarEvents} selectedDate={selectedDate}
                 settings={settings} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
                 onEventClick={(block, ev) => setEventPopover({ event: block, x: ev.clientX, y: ev.clientY })}
-                onCancelScheduled={cancelScheduledTask} />}
+                dragState={dragState} onDragChange={setDragState}
+                onDragEnd={() => {
+                  if (!dragState) return;
+                  const s = Math.min(dragState.startMinutes, dragState.currentMinutes);
+                  const e = Math.max(dragState.startMinutes, dragState.currentMinutes);
+                  setDragState(null);
+                  if (e - s >= 15) setShowSlotPicker({ startMinutes: s, endMinutes: e });
+                }} />}
               {view === 'calendar' && calendarMode === 'week' && <WeekView tasks={tasks} calendarEvents={calendarEvents} selectedDate={selectedDate} settings={settings}
                 toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
                 onDayClick={(d) => { setSelectedDate(d); setCalendarMode('day'); }}
@@ -947,9 +993,26 @@
             </div>
           </main>
 
+          {/* Slot Picker */}
+          {showSlotPicker && <SlotPicker slot={showSlotPicker} tasks={tasks}
+            onAssignExisting={assignTaskToSlot}
+            onCreateNew={createTaskFromSlot}
+            onClose={() => setShowSlotPicker(null)} />}
+
           {/* Task Modal */}
-          {showTaskModal && <TaskModal task={editingTask} onSave={(t) => { editingTask ? updateTask(editingTask.id, t) : addTask(t); setShowTaskModal(false); }}
-            onClose={() => setShowTaskModal(false)} />}
+          {showTaskModal && <TaskModal task={editingTask}
+            slotInfo={dragState && dragState.slotStart != null ? dragState : null}
+            onSave={(t) => {
+              if (editingTask) {
+                updateTask(editingTask.id, t);
+              } else {
+                addTask(t);
+              }
+              setShowTaskModal(false);
+              setDragState(null);
+            }}
+            onClose={() => { setShowTaskModal(false); setDragState(null); }}
+            onRemoveFromSchedule={schedule && editingTask && schedule.scheduled.some(s => (s.type === 'task' || s.type === 'soft-suggestion') && s.task && s.task.id === editingTask.id) ? cancelScheduledTask : null} />}
 
           {/* Event Popover */}
           {eventPopover && (() => {
@@ -997,7 +1060,8 @@
     }
 
     // ===== TODAY VIEW =====
-    function TodayView({ tasks, schedule, calendarEvents, selectedDate, settings, toggleDone, onEdit, onEventClick, onCancelScheduled }) {
+    function TodayView({ tasks, schedule, calendarEvents, selectedDate, settings, toggleDone, onEdit, onEventClick, dragState, onDragChange, onDragEnd }) {
+      const timelineRef = useRef(null);
       const incompleteTasks = tasks.filter(t => t.status !== 'done');
       const now = new Date();
       const dangerMs = settings.dangerZoneHours * 60 * 60 * 1000;
@@ -1052,6 +1116,7 @@
             const dayStartMins = displayStartHour * 60;
 
             // Build all blocks to display
+            const dateStr = new Date(selectedDate).toISOString().split('T')[0];
             const allBlocks = [];
             if (schedule) {
               schedule.scheduled.forEach(s => allBlocks.push(s));
@@ -1070,6 +1135,18 @@
                   event: e,
                 });
               });
+              // Also show manually-placed tasks
+              tasks.filter(t => t.status !== 'done' && t.scheduledDate === dateStr && t.scheduledStart != null && t.scheduledEnd != null).forEach(t => {
+                allBlocks.push({
+                  id: `manual-${t.id}`,
+                  taskId: t.id,
+                  task: t,
+                  startMinutes: t.scheduledStart,
+                  endMinutes: t.scheduledEnd,
+                  type: 'task',
+                  manual: true,
+                });
+              });
             }
 
             return (
@@ -1078,7 +1155,7 @@
                   <h3 className="text-sm font-semibold text-gray-700">
                     {schedule ? 'Scheduled Plan' : 'Timeline'}
                   </h3>
-                  {!schedule && <span className="text-xs text-gray-400">Click "Plan My Day" to auto-schedule</span>}
+                  {!schedule && <span className="text-xs text-gray-400">Drag to place tasks · or "Plan My Day"</span>}
                 </div>
                 <div className="relative" style={{ display: 'grid', gridTemplateColumns: '60px 1fr' }}>
                   {/* Hour labels + grid lines */}
@@ -1094,12 +1171,32 @@
                     })}
                   </div>
                   {/* Blocks area */}
-                  <div className="relative" style={{ height: totalHeight }}>
+                  <div className="relative select-none" style={{ height: totalHeight }} ref={timelineRef}
+                    onMouseDown={(e) => {
+                      if (e.target !== e.currentTarget && !e.target.classList.contains('hour-grid-line')) return;
+                      e.preventDefault();
+                      const rect = timelineRef.current.getBoundingClientRect();
+                      const offsetY = e.clientY - rect.top;
+                      const startMins = Math.max(0, Math.min(1440, snapTo15(dayStartMins + (offsetY / HOUR_HEIGHT) * 60)));
+                      onDragChange && onDragChange({ startMinutes: startMins, currentMinutes: startMins });
+                      const handleMove = (me) => {
+                        const oy = me.clientY - rect.top;
+                        const cm = Math.max(0, Math.min(1440, snapTo15(dayStartMins + (oy / HOUR_HEIGHT) * 60)));
+                        onDragChange && onDragChange({ startMinutes: startMins, currentMinutes: cm });
+                      };
+                      const handleUp = () => {
+                        document.removeEventListener('mousemove', handleMove);
+                        document.removeEventListener('mouseup', handleUp);
+                        onDragEnd && onDragEnd();
+                      };
+                      document.addEventListener('mousemove', handleMove);
+                      document.addEventListener('mouseup', handleUp);
+                    }}>
                     {/* Hour grid lines + available shading */}
                     {hours.map(hour => {
                       const isAvail = hour >= availStartHour && hour < availEndHour;
                       return (
-                        <div key={hour} className={`absolute w-full border-t border-gray-100 ${!isAvail ? 'bg-gray-50/50' : ''}`}
+                        <div key={hour} className={`hour-grid-line absolute w-full border-t border-gray-100 ${!isAvail ? 'bg-gray-50/50' : ''}`}
                           style={{ top: (hour - displayStartHour) * HOUR_HEIGHT, height: HOUR_HEIGHT }} />
                       );
                     })}
@@ -1134,17 +1231,10 @@
                           const cat = CATEGORIES[block.task.category];
                           const dur = block.endMinutes - block.startMinutes;
                           return (
-                            <div key={block.id} className="absolute rounded-md px-2 py-1 text-xs font-medium overflow-hidden cursor-pointer hover:opacity-80 z-10 group"
+                            <div key={block.id} className="absolute rounded-md px-2 py-1 text-xs font-medium overflow-hidden cursor-pointer hover:opacity-80 z-10"
                               style={{ top, height: height - 2, left: `calc(${leftPct}% + 4px)`, width: `calc(${widthPct}% - 8px)`, backgroundColor: cat.light, borderLeft: `3px solid ${cat.color}` }}
                               onClick={() => onEdit(block.task)}>
-                              <div className="flex items-start justify-between">
-                                <div className="truncate flex-1">{block.task.title}</div>
-                                {schedule && onCancelScheduled && (
-                                  <button className="opacity-0 group-hover:opacity-100 ml-1 -mr-1 -mt-0.5 w-4 h-4 flex items-center justify-center rounded-full hover:bg-black/10 text-gray-500 hover:text-gray-700 transition-opacity text-sm leading-none"
-                                    onClick={(ev) => { ev.stopPropagation(); onCancelScheduled(block.task.id); }}
-                                    title="Remove from schedule">&times;</button>
-                                )}
-                              </div>
+                              <div className="truncate">{block.task.title}</div>
                               {height > 30 && <div className="text-[10px] opacity-60">{dur}m · {fmt.timeShort(Math.floor(block.startMinutes/60), block.startMinutes%60)}</div>}
                               {block.type === 'soft-suggestion' && <span className="text-[10px] opacity-50">💡</span>}
                             </div>
@@ -1152,6 +1242,21 @@
                         }
                         return null;
                       });
+                    })()}
+                    {/* Drag preview */}
+                    {dragState && (() => {
+                      const dStart = Math.min(dragState.startMinutes, dragState.currentMinutes);
+                      const dEnd = Math.max(dragState.startMinutes, dragState.currentMinutes);
+                      const dTop = ((dStart - dayStartMins) / 60) * HOUR_HEIGHT;
+                      const dHeight = Math.max(((dEnd - dStart) / 60) * HOUR_HEIGHT, 15);
+                      return (
+                        <div className="absolute left-1 right-1 bg-violet-200/60 border-2 border-violet-400 border-dashed rounded-md pointer-events-none z-30 flex items-start px-2 py-1"
+                          style={{ top: dTop, height: dHeight }}>
+                          <span className="text-xs font-medium text-violet-700">
+                            {fmt.timeShort(Math.floor(dStart / 60), dStart % 60)} – {fmt.timeShort(Math.floor(dEnd / 60), dEnd % 60)}
+                          </span>
+                        </div>
+                      );
                     })()}
                     {/* Current time indicator */}
                     {new Date(selectedDate).toDateString() === new Date().toDateString() && (() => {
@@ -1833,28 +1938,131 @@
       );
     }
 
+    // ===== SLOT PICKER =====
+    function SlotPicker({ slot, tasks, onAssignExisting, onCreateNew, onClose }) {
+      const [mode, setMode] = useState(null); // null | 'existing'
+      const [search, setSearch] = useState('');
+      const incomplete = tasks.filter(t => t.status !== 'done' && !(t.scheduledStart != null && t.scheduledDate));
+      const filtered = search ? incomplete.filter(t => t.title.toLowerCase().includes(search.toLowerCase())) : incomplete;
+      const duration = slot.endMinutes - slot.startMinutes;
+
+      return (
+        <div className="fixed inset-0 bg-black/40 modal-overlay flex items-center justify-center z-50 p-4" onClick={onClose}>
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm fade-in overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-5 pt-5 pb-3 border-b border-gray-100">
+              <h3 className="text-base font-semibold text-gray-900">
+                {fmt.timeShort(Math.floor(slot.startMinutes / 60), slot.startMinutes % 60)} – {fmt.timeShort(Math.floor(slot.endMinutes / 60), slot.endMinutes % 60)}
+                <span className="text-sm font-normal text-gray-400 ml-2">{duration}m</span>
+              </h3>
+            </div>
+            <div className="px-5 py-4">
+              {!mode ? (
+                <div className="space-y-2">
+                  <button onClick={() => setMode('existing')}
+                    className="w-full p-3 text-left border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
+                    <div className="font-medium text-sm text-gray-900">Assign existing task</div>
+                    <div className="text-xs text-gray-500 mt-0.5">{incomplete.length} available tasks</div>
+                  </button>
+                  <button onClick={() => onCreateNew(slot.startMinutes, slot.endMinutes)}
+                    className="w-full p-3 text-left border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
+                    <div className="font-medium text-sm text-gray-900">Create new task</div>
+                    <div className="text-xs text-gray-500 mt-0.5">Pre-filled with this time slot</div>
+                  </button>
+                </div>
+              ) : (
+                <div>
+                  <input type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search tasks..."
+                    autoFocus className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 mb-3" />
+                  <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                    {filtered.length === 0 && <p className="text-xs text-gray-400 text-center py-4">No matching tasks</p>}
+                    {filtered.map(t => {
+                      const cat = CATEGORIES[t.category];
+                      return (
+                        <button key={t.id} onClick={() => onAssignExisting(t.id, slot.startMinutes, slot.endMinutes)}
+                          className="w-full text-left p-2.5 rounded-lg border border-gray-200 hover:border-violet-300 hover:bg-violet-50 transition-colors">
+                          <div className="flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: cat.color }} />
+                            <span className="text-sm font-medium text-gray-900 truncate">{t.title}</span>
+                          </div>
+                          <div className="text-xs text-gray-400 ml-4 mt-0.5">{cat.label} · {t.customMinutes || EFFORT[t.effort].minutes}m</div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="px-5 py-3 bg-gray-50 border-t border-gray-100 flex justify-between">
+              {mode && <button type="button" onClick={() => setMode(null)} className="px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100 rounded-lg">Back</button>}
+              <button type="button" onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100 rounded-lg ml-auto">Cancel</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     // ===== TASK MODAL =====
-    function TaskModal({ task, onSave, onClose }) {
+    function TaskModal({ task, onSave, onClose, onRemoveFromSchedule, slotInfo }) {
       const [title, setTitle] = useState(task?.title || '');
       const [notes, setNotes] = useState(task?.notes || '');
       const [category, setCategory] = useState(task?.category || 'research');
       const [effort, setEffort] = useState(task?.effort || 'medium');
-      const [customMinutes, setCustomMinutes] = useState(task?.customMinutes || '');
+      const [customMinutes, setCustomMinutes] = useState(() => {
+        if (task?.customMinutes) return task.customMinutes;
+        if (slotInfo) return slotInfo.slotDuration || (slotInfo.slotEnd - slotInfo.slotStart);
+        return '';
+      });
       const [importance, setImportance] = useState(task?.importance || 2);
       const [hasDeadline, setHasDeadline] = useState(!!task?.deadline);
       const [deadline, setDeadline] = useState(task?.deadline ? new Date(task.deadline).toISOString().slice(0, 16) : '');
-      const [assignedDate, setAssignedDate] = useState(task?.assignedDate || '');
+      const [assignedDate, setAssignedDate] = useState(() => {
+        if (task?.assignedDate) return task.assignedDate;
+        if (slotInfo?.slotDate) return slotInfo.slotDate;
+        return '';
+      });
       const [link, setLink] = useState(task?.link || '');
+      // Scheduled time fields
+      const [hasScheduledTime, setHasScheduledTime] = useState(!!(task?.scheduledStart != null || slotInfo));
+      const [schedStartH, setSchedStartH] = useState(() => {
+        if (task?.scheduledStart != null) return Math.floor(task.scheduledStart / 60);
+        if (slotInfo) return Math.floor(slotInfo.slotStart / 60);
+        return 9;
+      });
+      const [schedStartM, setSchedStartM] = useState(() => {
+        if (task?.scheduledStart != null) return task.scheduledStart % 60;
+        if (slotInfo) return slotInfo.slotStart % 60;
+        return 0;
+      });
+      const [schedEndH, setSchedEndH] = useState(() => {
+        if (task?.scheduledEnd != null) return Math.floor(task.scheduledEnd / 60);
+        if (slotInfo) return Math.floor(slotInfo.slotEnd / 60);
+        return 10;
+      });
+      const [schedEndM, setSchedEndM] = useState(() => {
+        if (task?.scheduledEnd != null) return task.scheduledEnd % 60;
+        if (slotInfo) return slotInfo.slotEnd % 60;
+        return 0;
+      });
+      const [schedDate, setSchedDate] = useState(() => {
+        if (task?.scheduledDate) return task.scheduledDate;
+        if (slotInfo?.slotDate) return slotInfo.slotDate;
+        return '';
+      });
 
       const handleSubmit = (e) => {
         e.preventDefault();
         if (!title.trim()) return;
+        const schedStart = hasScheduledTime ? schedStartH * 60 + schedStartM : null;
+        const schedEnd = hasScheduledTime ? schedEndH * 60 + schedEndM : null;
         onSave({
           title: title.trim(), notes, category, effort, importance,
           customMinutes: customMinutes ? Number(customMinutes) : null,
           deadline: hasDeadline && deadline ? new Date(deadline).toISOString() : null,
-          assignedDate: assignedDate || null,
+          assignedDate: assignedDate || schedDate || null,
           link: link.trim() || null,
+          scheduledStart: schedStart,
+          scheduledEnd: schedEnd,
+          scheduledDate: hasScheduledTime ? (schedDate || assignedDate || null) : null,
         });
       };
 
@@ -1975,6 +2183,44 @@
                   className="w-full px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 text-gray-600 placeholder-gray-300" />
               </div>
 
+              {/* Scheduled Time */}
+              <div className="mb-4">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={hasScheduledTime} onChange={e => setHasScheduledTime(e.target.checked)}
+                    className="rounded border-gray-300 text-violet-600 focus:ring-violet-500" />
+                  <span className="text-xs font-medium text-gray-500">Schedule at a specific time</span>
+                </label>
+                {hasScheduledTime && (
+                  <div className="mt-2 flex items-center gap-2 flex-wrap">
+                    <div className="flex items-center gap-1">
+                      <select value={schedStartH} onChange={e => setSchedStartH(Number(e.target.value))}
+                        className="px-2 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500">
+                        {Array.from({ length: 24 }, (_, i) => <option key={i} value={i}>{i === 0 ? '12' : i > 12 ? i - 12 : i}</option>)}
+                      </select>
+                      <span className="text-gray-400">:</span>
+                      <select value={schedStartM} onChange={e => setSchedStartM(Number(e.target.value))}
+                        className="px-2 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500">
+                        {[0, 15, 30, 45].map(m => <option key={m} value={m}>{String(m).padStart(2, '0')}</option>)}
+                      </select>
+                      <span className="text-xs text-gray-400">{schedStartH < 12 ? 'AM' : 'PM'}</span>
+                    </div>
+                    <span className="text-gray-400 text-sm">to</span>
+                    <div className="flex items-center gap-1">
+                      <select value={schedEndH} onChange={e => setSchedEndH(Number(e.target.value))}
+                        className="px-2 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500">
+                        {Array.from({ length: 24 }, (_, i) => <option key={i} value={i}>{i === 0 ? '12' : i > 12 ? i - 12 : i}</option>)}
+                      </select>
+                      <span className="text-gray-400">:</span>
+                      <select value={schedEndM} onChange={e => setSchedEndM(Number(e.target.value))}
+                        className="px-2 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500">
+                        {[0, 15, 30, 45].map(m => <option key={m} value={m}>{String(m).padStart(2, '0')}</option>)}
+                      </select>
+                      <span className="text-xs text-gray-400">{schedEndH < 12 ? 'AM' : 'PM'}</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
               {/* Notes */}
               <div className="mb-2">
                 <label className="block text-xs font-medium text-gray-500 mb-1">Notes (optional)</label>
@@ -1983,11 +2229,25 @@
               </div>
             </div>
 
-            <div className="px-5 py-3 bg-gray-50 flex justify-end gap-2 border-t border-gray-100 flex-shrink-0">
-              <button type="button" onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100 rounded-lg">Cancel</button>
-              <button type="submit" className="px-4 py-2 text-sm font-medium bg-violet-600 text-white rounded-lg hover:bg-violet-700">
-                {task ? 'Save' : 'Add Task'}
-              </button>
+            <div className="px-5 py-3 bg-gray-50 flex items-center border-t border-gray-100 flex-shrink-0">
+              {onRemoveFromSchedule && task && (
+                <button type="button" onClick={() => { onRemoveFromSchedule(task.id); onClose(); }}
+                  className="px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 rounded-lg mr-auto">
+                  Remove from Schedule
+                </button>
+              )}
+              {!onRemoveFromSchedule && task && task.scheduledStart != null && (
+                <button type="button" onClick={() => { onSave({ title: task.title, notes: task.notes, category: task.category, effort: task.effort, importance: task.importance, customMinutes: task.customMinutes, deadline: task.deadline, assignedDate: task.assignedDate, link: task.link, scheduledStart: null, scheduledEnd: null, scheduledDate: null }); }}
+                  className="px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 rounded-lg mr-auto">
+                  Clear Time
+                </button>
+              )}
+              <div className="flex gap-2 ml-auto">
+                <button type="button" onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100 rounded-lg">Cancel</button>
+                <button type="submit" className="px-4 py-2 text-sm font-medium bg-violet-600 text-white rounded-lg hover:bg-violet-700">
+                  {task ? 'Save' : 'Add Task'}
+                </button>
+              </div>
             </div>
           </form>
         </div>
