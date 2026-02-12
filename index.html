@@ -493,7 +493,8 @@
       const [tasks, setTasks] = useState(() => storage.get('tasks', []));
       const [settings, setSettings] = useState(() => storage.get('settings', DEFAULT_SETTINGS));
       const [eventClassifications, setEventClassifications] = useState(() => storage.get('eventClassifications', {}));
-      const [view, setView] = useState('today');
+      const [view, setView] = useState('calendar');
+      const [calendarMode, setCalendarMode] = useState('day'); // day, week, month
       const [showTaskModal, setShowTaskModal] = useState(false);
       const [editingTask, setEditingTask] = useState(null);
       const [calendarEvents, setCalendarEvents] = useState([]);
@@ -561,9 +562,18 @@
       const fetchEvents = async () => {
         try {
           const start = new Date(selectedDate);
-          start.setDate(start.getDate() - 1);
           const end = new Date(selectedDate);
-          end.setDate(end.getDate() + 8);
+          if (calendarMode === 'month') {
+            start.setDate(1); start.setDate(start.getDate() - 7);
+            end.setMonth(end.getMonth() + 1, 7);
+          } else if (calendarMode === 'week') {
+            const dow = start.getDay();
+            start.setDate(start.getDate() - (dow === 0 ? 6 : dow - 1));
+            end.setDate(start.getDate() + 8);
+          } else {
+            start.setDate(start.getDate() - 1);
+            end.setDate(end.getDate() + 2);
+          }
           const events = await GCalService.listEvents(start, end);
           setCalendarEvents(events);
         } catch (err) {
@@ -573,7 +583,7 @@
 
       useEffect(() => {
         if (gcalConnected) fetchEvents();
-      }, [selectedDate, gcalConnected]);
+      }, [selectedDate, gcalConnected, calendarMode]);
 
       // Auto-schedule
       const runAutoSchedule = () => {
@@ -643,8 +653,7 @@
             </div>
             <nav className="flex-1 p-3 space-y-1">
               {[
-                { id: 'today', label: 'Today', icon: '📅' },
-                { id: 'week', label: 'This Week', icon: '📋' },
+                { id: 'calendar', label: 'Calendar', icon: '📅' },
                 { id: 'all', label: 'All Tasks', icon: '📦' },
                 { id: 'settings', label: 'Settings', icon: '⚙️' },
               ].map(item => (
@@ -693,32 +702,68 @@
                 <button onClick={() => setSidebarOpen(true)} className="md:hidden p-2 text-gray-500 hover:bg-gray-100 rounded-lg">
                   <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h14M3 10h14M3 14h14"/></svg>
                 </button>
-                <h2 className="text-lg font-semibold text-gray-900">
-                  {view === 'today' ? fmt.date(selectedDate) : view === 'week' ? 'This Week' : view === 'all' ? 'All Tasks' : 'Settings'}
-                </h2>
-                {view === 'today' && (
-                  <div className="flex items-center gap-1 ml-2">
-                    <button onClick={() => { const d = new Date(selectedDate); d.setDate(d.getDate() - 1); setSelectedDate(d.toISOString().split('T')[0]); setSchedule(null); }}
-                      className="p-1 text-gray-400 hover:text-gray-600 rounded">‹</button>
+                {view === 'calendar' && (
+                  <>
+                    {/* Date nav arrows */}
+                    <button onClick={() => {
+                      const d = new Date(selectedDate);
+                      if (calendarMode === 'day') d.setDate(d.getDate() - 1);
+                      else if (calendarMode === 'week') d.setDate(d.getDate() - 7);
+                      else d.setMonth(d.getMonth() - 1);
+                      setSelectedDate(d.toISOString().split('T')[0]); setSchedule(null);
+                    }} className="p-1 text-gray-400 hover:text-gray-600 rounded text-lg">‹</button>
                     <button onClick={() => { setSelectedDate(new Date().toISOString().split('T')[0]); setSchedule(null); }}
                       className="px-2 py-0.5 text-xs font-medium text-violet-600 bg-violet-50 rounded-full hover:bg-violet-100">Today</button>
-                    <button onClick={() => { const d = new Date(selectedDate); d.setDate(d.getDate() + 1); setSelectedDate(d.toISOString().split('T')[0]); setSchedule(null); }}
-                      className="p-1 text-gray-400 hover:text-gray-600 rounded">›</button>
-                  </div>
+                    <button onClick={() => {
+                      const d = new Date(selectedDate);
+                      if (calendarMode === 'day') d.setDate(d.getDate() + 1);
+                      else if (calendarMode === 'week') d.setDate(d.getDate() + 7);
+                      else d.setMonth(d.getMonth() + 1);
+                      setSelectedDate(d.toISOString().split('T')[0]); setSchedule(null);
+                    }} className="p-1 text-gray-400 hover:text-gray-600 rounded text-lg">›</button>
+                    <h2 className="text-lg font-semibold text-gray-900 ml-1">
+                      {calendarMode === 'day' ? fmt.date(selectedDate)
+                        : calendarMode === 'week' ? (() => {
+                          const d = new Date(selectedDate); const day = d.getDay();
+                          const mon = new Date(d); mon.setDate(d.getDate() - (day === 0 ? 6 : day - 1));
+                          const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+                          return `${mon.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${sun.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
+                        })()
+                        : new Date(selectedDate).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                    </h2>
+                  </>
+                )}
+                {view !== 'calendar' && (
+                  <h2 className="text-lg font-semibold text-gray-900">
+                    {view === 'all' ? 'All Tasks' : 'Settings'}
+                  </h2>
                 )}
               </div>
               <div className="flex items-center gap-2">
-                {view === 'today' && (
+                {view === 'calendar' && (
                   <>
-                    <button onClick={runAutoSchedule}
-                      className="px-3 py-1.5 text-sm font-medium bg-violet-600 text-white rounded-lg hover:bg-violet-700 transition-colors">
-                      Plan My Day
-                    </button>
-                    {gcalConnected && schedule && (
-                      <button onClick={pushToGCal} disabled={gcalLoading}
-                        className="px-3 py-1.5 text-sm font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-colors disabled:opacity-50">
-                        {gcalLoading ? '...' : 'Push to GCal'}
-                      </button>
+                    {/* Day / Week / Month toggle */}
+                    <div className="flex bg-gray-100 rounded-lg p-0.5">
+                      {[['day', 'Day'], ['week', 'Week'], ['month', 'Month']].map(([mode, label]) => (
+                        <button key={mode} onClick={() => setCalendarMode(mode)}
+                          className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${calendarMode === mode ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                    {calendarMode === 'day' && (
+                      <>
+                        <button onClick={runAutoSchedule}
+                          className="px-3 py-1.5 text-sm font-medium bg-violet-600 text-white rounded-lg hover:bg-violet-700 transition-colors">
+                          Plan My Day
+                        </button>
+                        {gcalConnected && schedule && (
+                          <button onClick={pushToGCal} disabled={gcalLoading}
+                            className="px-3 py-1.5 text-sm font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-colors disabled:opacity-50">
+                            {gcalLoading ? '...' : 'Push to GCal'}
+                          </button>
+                        )}
+                      </>
                     )}
                   </>
                 )}
@@ -731,10 +776,14 @@
 
             {/* Content */}
             <div className="flex-1 overflow-y-auto p-4 md:p-6">
-              {view === 'today' && <TodayView tasks={tasks} schedule={schedule} calendarEvents={calendarEvents} selectedDate={selectedDate}
+              {view === 'calendar' && calendarMode === 'day' && <TodayView tasks={tasks} schedule={schedule} calendarEvents={calendarEvents} selectedDate={selectedDate}
                 settings={settings} eventClassifications={eventClassifications} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }} />}
-              {view === 'week' && <WeekView tasks={tasks} calendarEvents={calendarEvents} selectedDate={selectedDate} settings={settings}
-                eventClassifications={eventClassifications} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }} />}
+              {view === 'calendar' && calendarMode === 'week' && <WeekView tasks={tasks} calendarEvents={calendarEvents} selectedDate={selectedDate} settings={settings}
+                eventClassifications={eventClassifications} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
+                onDayClick={(d) => { setSelectedDate(d); setCalendarMode('day'); }} />}
+              {view === 'calendar' && calendarMode === 'month' && <MonthView tasks={tasks} calendarEvents={calendarEvents} selectedDate={selectedDate}
+                eventClassifications={eventClassifications} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
+                onDayClick={(d) => { setSelectedDate(d); setCalendarMode('day'); }} />}
               {view === 'all' && <AllTasksView tasks={tasks} toggleDone={toggleDone} deleteTask={deleteTask}
                 onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }} />}
               {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} gcalConnected={gcalConnected}
@@ -807,81 +856,115 @@
           )}
 
           {/* Timeline */}
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-            <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-gray-700">
-                {schedule ? 'Scheduled Plan' : 'Timeline'}
-              </h3>
-              {!schedule && <span className="text-xs text-gray-400">Click "Plan My Day" to auto-schedule</span>}
-            </div>
-            <div className="timeline-grid">
-              {hours.map(hour => {
-                const blocksThisHour = schedule?.scheduled.filter(s =>
-                  s.startMinutes < timeToMinutes(hour + 1) && s.endMinutes > timeToMinutes(hour)
-                ) || [];
+          {(() => {
+            const HOUR_HEIGHT = 60; // px per hour
+            const totalHeight = 24 * HOUR_HEIGHT;
+            const dayStartMins = displayStartHour * 60;
 
-                const eventsThisHour = calendarEvents.filter(e => {
-                  if (e.allDay) return false;
-                  const es = new Date(e.start);
-                  if (es.toDateString() !== new Date(selectedDate).toDateString()) return false;
-                  const eStart = timeToMinutes(es.getHours(), es.getMinutes());
-                  const eEnd = timeToMinutes(new Date(e.end).getHours(), new Date(e.end).getMinutes());
-                  return eStart < timeToMinutes(hour + 1) && eEnd > timeToMinutes(hour);
-                });
-
-                const displayBlocks = schedule ? blocksThisHour : eventsThisHour.map(e => ({
+            // Build all blocks to display
+            const allBlocks = [];
+            if (schedule) {
+              schedule.scheduled.forEach(s => allBlocks.push(s));
+            } else {
+              calendarEvents.forEach(e => {
+                if (e.allDay) return;
+                const es = new Date(e.start);
+                if (es.toDateString() !== new Date(selectedDate).toDateString()) return;
+                allBlocks.push({
                   id: e.id,
                   title: e.title,
                   type: 'event',
                   classification: eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard',
-                  startMinutes: timeToMinutes(new Date(e.start).getHours(), new Date(e.start).getMinutes()),
+                  startMinutes: timeToMinutes(es.getHours(), es.getMinutes()),
                   endMinutes: timeToMinutes(new Date(e.end).getHours(), new Date(e.end).getMinutes()),
-                }));
+                  event: e,
+                });
+              });
+            }
 
-                const isAvailableHour = hour >= availStartHour && hour < availEndHour;
+            return (
+              <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+                <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-gray-700">
+                    {schedule ? 'Scheduled Plan' : 'Timeline'}
+                  </h3>
+                  {!schedule && <span className="text-xs text-gray-400">Click "Plan My Day" to auto-schedule</span>}
+                </div>
+                <div className="relative" style={{ display: 'grid', gridTemplateColumns: '60px 1fr' }}>
+                  {/* Hour labels + grid lines */}
+                  <div style={{ height: totalHeight }} className="relative">
+                    {hours.map(hour => {
+                      const isAvail = hour >= availStartHour && hour < availEndHour;
+                      return (
+                        <div key={hour} className={`absolute w-full px-2 text-xs text-right font-medium ${isAvail ? 'text-violet-400' : 'text-gray-300'}`}
+                          style={{ top: (hour - displayStartHour) * HOUR_HEIGHT, height: HOUR_HEIGHT, paddingTop: 4 }}>
+                          {fmt.timeShort(hour)}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {/* Blocks area */}
+                  <div className="relative" style={{ height: totalHeight }}>
+                    {/* Hour grid lines + available shading */}
+                    {hours.map(hour => {
+                      const isAvail = hour >= availStartHour && hour < availEndHour;
+                      return (
+                        <div key={hour} className={`absolute w-full border-t border-gray-100 ${!isAvail ? 'bg-gray-50/50' : ''}`}
+                          style={{ top: (hour - displayStartHour) * HOUR_HEIGHT, height: HOUR_HEIGHT }} />
+                      );
+                    })}
+                    {/* Positioned blocks */}
+                    {allBlocks.map(block => {
+                      const top = ((block.startMinutes - dayStartMins) / 60) * HOUR_HEIGHT;
+                      const height = Math.max(((block.endMinutes - block.startMinutes) / 60) * HOUR_HEIGHT, 20);
 
-                return (
-                  <React.Fragment key={hour}>
-                    <div className={`time-slot px-2 py-2 text-xs text-right font-medium ${isAvailableHour ? 'text-violet-400' : 'text-gray-300'}`}>
-                      {fmt.timeShort(hour)}
-                    </div>
-                    <div className={`time-slot px-2 py-1 relative ${!isAvailableHour ? 'bg-gray-50/50' : ''}`}>
-                      {displayBlocks.filter(b => {
-                        const blockStartHour = Math.floor(b.startMinutes / 60);
-                        return blockStartHour === hour || (b.startMinutes < timeToMinutes(hour) && hour === displayStartHour);
-                      }).map(block => {
-                        if (block.type === 'event') {
-                          const cls = block.classification;
-                          const bgColor = cls === 'soft' ? 'bg-gray-100 border-gray-300 text-gray-600' : cls === 'academic' ? 'bg-violet-100 border-violet-300 text-violet-700' : 'bg-blue-100 border-blue-300 text-blue-700';
-                          return (
-                            <div key={block.id} className={`${bgColor} border rounded-md px-2 py-1 text-xs font-medium mb-1`}>
-                              {block.title}
-                              {cls === 'soft' && <span className="ml-1 opacity-60">(available)</span>}
-                            </div>
-                          );
-                        }
-                        if (block.type === 'task' || block.type === 'soft-suggestion') {
-                          const cat = CATEGORIES[block.task.category];
-                          const dur = block.endMinutes - block.startMinutes;
-                          return (
-                            <div key={block.id}
-                              className="rounded-md px-2 py-1.5 text-xs font-medium mb-1 flex items-center gap-2 cursor-pointer hover:opacity-80"
-                              style={{ backgroundColor: cat.light, borderLeft: `3px solid ${cat.color}` }}
-                              onClick={() => onEdit(block.task)}>
-                              <span className="truncate">{block.task.title}</span>
-                              <span className="text-[10px] opacity-60 flex-shrink-0">{dur}m</span>
-                              {block.type === 'soft-suggestion' && <span className="text-[10px] opacity-50">💡</span>}
-                            </div>
-                          );
-                        }
-                        return null;
-                      })}
-                    </div>
-                  </React.Fragment>
-                );
-              })}
-            </div>
-          </div>
+                      if (block.type === 'event') {
+                        const cls = block.classification;
+                        const colors = cls === 'soft'
+                          ? { bg: '#F3F4F6', border: '#D1D5DB', text: '#4B5563' }
+                          : cls === 'academic'
+                          ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9' }
+                          : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8' };
+                        return (
+                          <div key={block.id} className="absolute left-1 right-2 rounded-md px-2 py-1 text-xs font-medium overflow-hidden z-10"
+                            style={{ top, height: height - 2, backgroundColor: colors.bg, borderLeft: `3px solid ${colors.border}`, color: colors.text }}>
+                            <div className="truncate">{block.title}</div>
+                            {height > 30 && <div className="text-[10px] opacity-60">{fmt.timeShort(Math.floor(block.startMinutes/60), block.startMinutes%60)} – {fmt.timeShort(Math.floor(block.endMinutes/60), block.endMinutes%60)}</div>}
+                            {cls === 'soft' && <span className="text-[10px] opacity-50">(available)</span>}
+                          </div>
+                        );
+                      }
+                      if (block.type === 'task' || block.type === 'soft-suggestion') {
+                        const cat = CATEGORIES[block.task.category];
+                        const dur = block.endMinutes - block.startMinutes;
+                        return (
+                          <div key={block.id} className="absolute left-1 right-2 rounded-md px-2 py-1 text-xs font-medium overflow-hidden cursor-pointer hover:opacity-80 z-10"
+                            style={{ top, height: height - 2, backgroundColor: cat.light, borderLeft: `3px solid ${cat.color}` }}
+                            onClick={() => onEdit(block.task)}>
+                            <div className="truncate">{block.task.title}</div>
+                            {height > 30 && <div className="text-[10px] opacity-60">{dur}m · {fmt.timeShort(Math.floor(block.startMinutes/60), block.startMinutes%60)}</div>}
+                            {block.type === 'soft-suggestion' && <span className="text-[10px] opacity-50">💡</span>}
+                          </div>
+                        );
+                      }
+                      return null;
+                    })}
+                    {/* Current time indicator */}
+                    {new Date(selectedDate).toDateString() === new Date().toDateString() && (() => {
+                      const nowMins = timeToMinutes(new Date().getHours(), new Date().getMinutes());
+                      const top = ((nowMins - dayStartMins) / 60) * HOUR_HEIGHT;
+                      return (
+                        <div className="absolute left-0 right-0 z-20 flex items-center" style={{ top }}>
+                          <div className="w-2 h-2 bg-red-500 rounded-full -ml-1" />
+                          <div className="flex-1 h-px bg-red-500" />
+                        </div>
+                      );
+                    })()}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Unscheduled tasks */}
           {schedule && (() => {
@@ -902,10 +985,10 @@
     }
 
     // ===== WEEK VIEW =====
-    function WeekView({ tasks, calendarEvents, selectedDate, settings, eventClassifications, toggleDone, onEdit }) {
+    function WeekView({ tasks, calendarEvents, selectedDate, settings, eventClassifications, toggleDone, onEdit, onDayClick }) {
       const weekStart = new Date(selectedDate);
-      const day = weekStart.getDay();
-      weekStart.setDate(weekStart.getDate() - (day === 0 ? 6 : day - 1)); // Monday
+      const dayOfWeek = weekStart.getDay();
+      weekStart.setDate(weekStart.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
 
       const days = Array.from({ length: 7 }, (_, i) => {
         const d = new Date(weekStart);
@@ -913,59 +996,187 @@
         return d;
       });
 
-      const incompleteTasks = tasks.filter(t => t.status !== 'done');
+      const HOUR_HEIGHT = 40;
+      const hours = Array.from({ length: 24 }, (_, i) => i);
+      const totalHeight = 24 * HOUR_HEIGHT;
+      const todayStr = new Date().toISOString().split('T')[0];
 
       return (
-        <div className="fade-in">
-          <div className="grid grid-cols-1 md:grid-cols-7 gap-3">
+        <div className="fade-in bg-white rounded-xl border border-gray-200 overflow-hidden">
+          {/* Day headers */}
+          <div className="grid border-b border-gray-200 sticky top-0 bg-white z-20" style={{ gridTemplateColumns: '50px repeat(7, 1fr)' }}>
+            <div className="border-r border-gray-100" />
             {days.map(d => {
               const dateStr = d.toISOString().split('T')[0];
-              const isToday = dateStr === new Date().toISOString().split('T')[0];
-              const dayEvents = calendarEvents.filter(e => {
-                const es = new Date(e.start);
-                return es.toDateString() === d.toDateString() && !e.allDay;
-              });
-              const dayTasks = incompleteTasks.filter(t => t.deadline && new Date(t.deadline).toDateString() === d.toDateString());
-
+              const isToday = dateStr === todayStr;
               return (
-                <div key={dateStr} className={`bg-white rounded-xl border p-3 ${isToday ? 'border-violet-300 ring-1 ring-violet-100' : 'border-gray-200'}`}>
-                  <div className={`text-xs font-semibold mb-2 ${isToday ? 'text-violet-600' : 'text-gray-500'}`}>
-                    {d.toLocaleDateString('en-US', { weekday: 'short', day: 'numeric' })}
+                <div key={dateStr} className={`px-1 py-2 text-center border-r border-gray-100 cursor-pointer hover:bg-gray-50 ${isToday ? 'bg-violet-50' : ''}`}
+                  onClick={() => onDayClick && onDayClick(dateStr)}>
+                  <div className={`text-[10px] font-medium uppercase ${isToday ? 'text-violet-600' : 'text-gray-400'}`}>
+                    {d.toLocaleDateString('en-US', { weekday: 'short' })}
                   </div>
-                  <div className="space-y-1">
-                    {dayEvents.slice(0, 4).map(e => (
-                      <div key={e.id} className="text-[11px] bg-blue-50 text-blue-700 rounded px-1.5 py-0.5 truncate">
-                        {fmt.time(e.start)} {e.title}
-                      </div>
-                    ))}
-                    {dayTasks.map(t => (
-                      <div key={t.id} className="text-[11px] rounded px-1.5 py-0.5 truncate cursor-pointer hover:opacity-80"
-                        style={{ backgroundColor: CATEGORIES[t.category].light, color: CATEGORIES[t.category].color }}
-                        onClick={() => onEdit(t)}>
-                        {EFFORT[t.effort].icon} {t.title}
-                      </div>
-                    ))}
-                    {dayEvents.length === 0 && dayTasks.length === 0 && (
-                      <div className="text-[11px] text-gray-300 italic">No events</div>
-                    )}
+                  <div className={`text-sm font-semibold ${isToday ? 'text-white bg-violet-600 w-7 h-7 rounded-full flex items-center justify-center mx-auto' : 'text-gray-700'}`}>
+                    {d.getDate()}
                   </div>
                 </div>
               );
             })}
           </div>
+          {/* Time grid */}
+          <div className="overflow-y-auto" style={{ maxHeight: 'calc(100vh - 200px)' }}>
+            <div className="grid relative" style={{ gridTemplateColumns: '50px repeat(7, 1fr)', height: totalHeight }}>
+              {/* Hour labels */}
+              <div className="relative border-r border-gray-100">
+                {hours.map(h => (
+                  <div key={h} className="absolute w-full px-1 text-[10px] text-gray-300 text-right font-medium"
+                    style={{ top: h * HOUR_HEIGHT, height: HOUR_HEIGHT, paddingTop: 2 }}>
+                    {h > 0 ? fmt.timeShort(h) : ''}
+                  </div>
+                ))}
+              </div>
+              {/* Day columns */}
+              {days.map((d, dayIdx) => {
+                const dateStr = d.toISOString().split('T')[0];
+                const dayEvents = calendarEvents.filter(e => {
+                  if (e.allDay) return false;
+                  return new Date(e.start).toDateString() === d.toDateString();
+                });
 
-          {/* Tasks without deadlines */}
-          <div className="mt-6 bg-white rounded-xl border border-gray-200 p-4">
-            <h3 className="text-sm font-semibold text-gray-700 mb-3">Backlog (no deadline)</h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-              {incompleteTasks.filter(t => !t.deadline).map(t => (
-                <MiniTaskCard key={t.id} task={t} toggleDone={toggleDone} onEdit={onEdit} />
-              ))}
-              {incompleteTasks.filter(t => !t.deadline).length === 0 && (
-                <div className="text-sm text-gray-400">No backlog tasks</div>
-              )}
+                return (
+                  <div key={dateStr} className="relative border-r border-gray-100">
+                    {/* Hour lines */}
+                    {hours.map(h => (
+                      <div key={h} className="absolute w-full border-t border-gray-50"
+                        style={{ top: h * HOUR_HEIGHT, height: HOUR_HEIGHT }} />
+                    ))}
+                    {/* Events */}
+                    {dayEvents.map(e => {
+                      const es = new Date(e.start);
+                      const ee = new Date(e.end);
+                      const startMins = timeToMinutes(es.getHours(), es.getMinutes());
+                      const endMins = timeToMinutes(ee.getHours(), ee.getMinutes());
+                      const top = (startMins / 60) * HOUR_HEIGHT;
+                      const height = Math.max(((endMins - startMins) / 60) * HOUR_HEIGHT, 16);
+                      const cls = eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard';
+                      const colors = cls === 'soft'
+                        ? { bg: '#F3F4F6', border: '#D1D5DB', text: '#4B5563' }
+                        : cls === 'academic'
+                        ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9' }
+                        : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8' };
+                      return (
+                        <div key={e.id} className="absolute left-0.5 right-0.5 rounded px-1 py-0.5 text-[10px] font-medium overflow-hidden z-10"
+                          style={{ top, height: height - 1, backgroundColor: colors.bg, borderLeft: `2px solid ${colors.border}`, color: colors.text }}>
+                          <div className="truncate leading-tight">{e.title}</div>
+                        </div>
+                      );
+                    })}
+                    {/* Current time line */}
+                    {dateStr === todayStr && (() => {
+                      const nowMins = timeToMinutes(new Date().getHours(), new Date().getMinutes());
+                      return <div className="absolute left-0 right-0 z-20 h-px bg-red-500" style={{ top: (nowMins / 60) * HOUR_HEIGHT }} />;
+                    })()}
+                  </div>
+                );
+              })}
             </div>
           </div>
+        </div>
+      );
+    }
+
+    // ===== MONTH VIEW =====
+    function MonthView({ tasks, calendarEvents, selectedDate, eventClassifications, toggleDone, onEdit, onDayClick }) {
+      const current = new Date(selectedDate);
+      const year = current.getFullYear();
+      const month = current.getMonth();
+
+      // First day of month and its weekday (Mon=0)
+      const firstDay = new Date(year, month, 1);
+      const lastDay = new Date(year, month + 1, 0);
+      const startDow = firstDay.getDay() === 0 ? 6 : firstDay.getDay() - 1; // Mon-based
+
+      // Build 6 weeks grid
+      const gridStart = new Date(firstDay);
+      gridStart.setDate(gridStart.getDate() - startDow);
+
+      const weeks = [];
+      const cursor = new Date(gridStart);
+      for (let w = 0; w < 6; w++) {
+        const week = [];
+        for (let d = 0; d < 7; d++) {
+          week.push(new Date(cursor));
+          cursor.setDate(cursor.getDate() + 1);
+        }
+        weeks.push(week);
+        // Stop if we've passed the month and completed the week
+        if (cursor.getMonth() !== month && weeks.length >= 4) break;
+      }
+
+      const todayStr = new Date().toISOString().split('T')[0];
+      const incompleteTasks = tasks.filter(t => t.status !== 'done');
+
+      return (
+        <div className="fade-in bg-white rounded-xl border border-gray-200 overflow-hidden">
+          {/* Weekday headers */}
+          <div className="grid grid-cols-7 border-b border-gray-200">
+            {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map(d => (
+              <div key={d} className="px-2 py-2 text-[10px] font-semibold text-gray-400 uppercase text-center border-r border-gray-100 last:border-r-0">
+                {d}
+              </div>
+            ))}
+          </div>
+          {/* Weeks */}
+          {weeks.map((week, wi) => (
+            <div key={wi} className="grid grid-cols-7 border-b border-gray-100 last:border-b-0">
+              {week.map(d => {
+                const dateStr = d.toISOString().split('T')[0];
+                const isToday = dateStr === todayStr;
+                const isCurrentMonth = d.getMonth() === month;
+                const dayEvents = calendarEvents.filter(e => {
+                  const es = new Date(e.start);
+                  return es.toDateString() === d.toDateString();
+                });
+                const dayTasks = incompleteTasks.filter(t => t.deadline && new Date(t.deadline).toDateString() === d.toDateString());
+                const items = [...dayEvents.map(e => ({ type: 'event', title: e.title, id: e.id,
+                  cls: eventClassifications[e.id] || eventClassifications[e.title?.toLowerCase()] || 'hard' })),
+                  ...dayTasks.map(t => ({ type: 'task', title: t.title, id: t.id, task: t }))];
+
+                return (
+                  <div key={dateStr}
+                    className={`min-h-[80px] md:min-h-[100px] px-1 py-1 border-r border-gray-100 last:border-r-0 cursor-pointer hover:bg-gray-50 transition-colors ${!isCurrentMonth ? 'bg-gray-50/50' : ''}`}
+                    onClick={() => onDayClick && onDayClick(dateStr)}>
+                    <div className={`text-xs font-medium mb-1 ${isToday ? 'text-white bg-violet-600 w-6 h-6 rounded-full flex items-center justify-center' : isCurrentMonth ? 'text-gray-700 pl-1' : 'text-gray-300 pl-1'}`}>
+                      {d.getDate()}
+                    </div>
+                    <div className="space-y-0.5">
+                      {items.slice(0, 3).map(item => {
+                        if (item.type === 'event') {
+                          const colors = item.cls === 'soft' ? '#9CA3AF' : item.cls === 'academic' ? '#7C3AED' : '#3B82F6';
+                          return (
+                            <div key={item.id} className="text-[10px] leading-tight truncate rounded px-1 py-0.5 text-white font-medium"
+                              style={{ backgroundColor: colors }}>
+                              {item.title}
+                            </div>
+                          );
+                        }
+                        const cat = CATEGORIES[item.task.category];
+                        return (
+                          <div key={item.id} className="text-[10px] leading-tight truncate rounded px-1 py-0.5 font-medium"
+                            style={{ backgroundColor: cat.light, color: cat.color }}
+                            onClick={(e) => { e.stopPropagation(); onEdit(item.task); }}>
+                            {item.title}
+                          </div>
+                        );
+                      })}
+                      {items.length > 3 && (
+                        <div className="text-[9px] text-gray-400 pl-1">+{items.length - 3} more</div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
         </div>
       );
     }
