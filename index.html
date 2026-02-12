@@ -1518,7 +1518,8 @@
         return d;
       });
 
-      const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      const dayLabels = ['M', 'Tu', 'W', 'Th', 'F', 'Sa', 'Su'];
+      const dayHeaderLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
       // Group tasks by day
       const tasksByDay = {};
@@ -1587,7 +1588,7 @@
               <div key={dateStr} className={`rounded-xl border p-4 ${isToday ? 'bg-violet-50 border-violet-200' : 'bg-white border-gray-200'}`}>
                 <div className="flex items-center justify-between mb-2">
                   <h3 className={`text-sm font-semibold ${isToday ? 'text-violet-700' : isPast ? 'text-gray-400' : 'text-gray-700'}`}>
-                    {dayLabels[i]} {d.getDate()}{isToday ? ' — Today' : ''}
+                    {dayHeaderLabels[i]} {d.getDate()}{isToday ? ' — Today' : ''}
                   </h3>
                   {dayTasks.length > 0 && (
                     <span className="text-[10px] text-gray-400 font-medium">
@@ -1658,11 +1659,15 @@
                 const isPast = d < new Date(todayStr) && dateStr !== todayStr;
                 return (
                   <button key={dateStr} onClick={() => assignToDay(task.id, isAssigned ? null : dateStr)}
-                    className={`w-6 h-5 text-[9px] font-semibold rounded transition-colors ${isAssigned ? 'bg-violet-600 text-white' : isPast ? 'bg-gray-50 text-gray-300' : 'bg-gray-100 text-gray-500 hover:bg-violet-100 hover:text-violet-600'}`}>
-                    {dayLabels[i].charAt(0)}
+                    className={`px-1 h-5 text-[9px] font-semibold rounded transition-colors ${isAssigned ? 'bg-violet-600 text-white' : isPast ? 'bg-gray-50 text-gray-300' : 'bg-gray-100 text-gray-500 hover:bg-violet-100 hover:text-violet-600'}`}>
+                    {dayLabels[i]}
                   </button>
                 );
               })}
+              <button onClick={() => assignToDay(task.id, null)}
+                className={`px-1 h-5 text-[9px] font-medium rounded transition-colors ${!task.assignedDate ? 'bg-gray-300 text-white' : 'bg-gray-100 text-gray-400 hover:bg-gray-200'}`}>
+                None
+              </button>
             </div>
           </div>
           <button onClick={() => deleteTask(task.id)}
@@ -2149,15 +2154,15 @@
                       d.setDate(monday.getDate() + i);
                       return d;
                     });
-                    return days.map(d => {
+                    const modalDayLabels = ['M', 'Tu', 'W', 'Th', 'F', 'Sa', 'Su'];
+                    return days.map((d, i) => {
                       const dateStr = d.toISOString().split('T')[0];
-                      const dayLabel = d.toLocaleDateString('en-US', { weekday: 'short' }).charAt(0);
                       const isSelected = assignedDate === dateStr;
                       const isPast = d < new Date(new Date().toDateString());
                       return (
                         <button key={dateStr} type="button" onClick={() => { const newDate = isSelected ? '' : dateStr; setAssignedDate(newDate); if (hasScheduledTime && newDate && schedDate !== newDate) { setSchedDate(newDate); } if (!newDate) { setHasScheduledTime(false); } }}
                           className={`w-9 h-9 text-xs font-semibold rounded-lg transition-colors ${isSelected ? 'bg-violet-600 text-white' : isPast ? 'bg-gray-50 text-gray-300' : 'bg-gray-50 text-gray-600 hover:bg-gray-100'}`}>
-                          <div className="text-[10px] leading-tight">{dayLabel}</div>
+                          <div className="text-[10px] leading-tight">{modalDayLabels[i]}</div>
                           <div className="text-[10px] leading-tight">{d.getDate()}</div>
                         </button>
                       );
