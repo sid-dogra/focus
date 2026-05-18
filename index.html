@@ -163,7 +163,16 @@
         if (diff < 24) return `${diff}h left`;
         const days = Math.ceil(diff / 24);
         return days === 1 ? 'Tomorrow' : `${days} days`;
-      }
+      },
+      // Compact relative-past for the sync indicator: 'just now' / '3m ago' / '2h ago' / '5d ago'.
+      ago: (ms) => {
+        if (!ms) return 'never';
+        const delta = Date.now() - ms;
+        if (delta < 60_000) return 'just now';
+        if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m ago`;
+        if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)}h ago`;
+        return `${Math.floor(delta / 86_400_000)}d ago`;
+      },
     };
 
     const timeToMinutes = (h, m = 0) => h * 60 + m;
@@ -800,6 +809,7 @@
       const [dragState, setDragState] = useState(null); // { startMinutes, currentMinutes }
       const [showSlotPicker, setShowSlotPicker] = useState(null); // { startMinutes, endMinutes }
       const [syncStatus, setSyncStatus] = useState(null); // null | 'syncing' | 'synced' | 'error' | 'disconnected'
+      const [lastSyncTime, setLastSyncTime] = useState(() => storage.get('lastSyncTime', 0));
       const syncTimer = useRef(null);
       const initialSyncDone = useRef(false);
 
@@ -830,9 +840,10 @@
                 setTasks(mergedTasks);
                 setTombstones(mergedTombstones);
                 if (remote && remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
-                storage.set('lastSyncTime', Date.now());
+                const now = Date.now();
+                storage.set('lastSyncTime', now);
+                setLastSyncTime(now);
                 setSyncStatus('synced');
-                setTimeout(() => setSyncStatus(prev => prev === 'synced' ? null : prev), 2000);
               } catch (err) {
                 console.warn('Focus-retry sync load failed', err);
                 setSyncStatus('error');
@@ -895,7 +906,11 @@
             lastModified: Date.now(),
           });
           setSyncStatus(ok ? 'synced' : 'error');
-          if (ok) setTimeout(() => setSyncStatus(prev => prev === 'synced' ? null : prev), 2000);
+          if (ok) {
+            const now = Date.now();
+            setLastSyncTime(now);
+            storage.set('lastSyncTime', now);
+          }
         }, 2000);
       }, [gcalConnected]);
 
@@ -927,11 +942,12 @@
                         setTasks(mergedTasks);
                         setTombstones(mergedTombstones);
                         if (remote && remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
-                        storage.set('lastSyncTime', Date.now());
                       }
+                      const now = Date.now();
+                      storage.set('lastSyncTime', now);
+                      setLastSyncTime(now);
                       initialSyncDone.current = true;
                       setSyncStatus('synced');
-                      setTimeout(() => setSyncStatus(prev => prev === 'synced' ? null : prev), 2000);
                     } catch (err) {
                       console.warn('Drive sync load failed', err);
                       initialSyncDone.current = true;
@@ -1014,14 +1030,59 @@
                 if (remote && remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
                 if (remoteTasks.length > 0) notify('Synced data from cloud');
               }
-              storage.set('lastSyncTime', Date.now());
-            } catch (err) { console.warn('Drive sync on connect failed', err); }
+              const nowTs = Date.now();
+              storage.set('lastSyncTime', nowTs);
+              setLastSyncTime(nowTs);
+              setSyncStatus('synced');
+            } catch (err) { console.warn('Drive sync on connect failed', err); setSyncStatus('error'); }
             initialSyncDone.current = true;
           }
         } catch (err) {
           notify('Failed to connect: ' + err, 'error');
         }
         setGcalLoading(false);
+      };
+
+      // Force an immediate Drive round-trip: save local state, reload remote, re-merge.
+      // Used by the sync indicator button so the user has a deterministic way to flush
+      // pending changes and pull updates without waiting for the 2s debounce or hoping
+      // the silent-auth retry-on-focus fires.
+      const forceSync = async () => {
+        // If we aren't connected (no auth or silent-auth never completed), kick the
+        // manual connect flow — that handles auth + initial merge + initialSyncDone.
+        if (!gcalConnected || !initialSyncDone.current) {
+          await connectGCal();
+          return;
+        }
+        // Clear any pending debounced save — we're about to do it ourselves.
+        if (syncTimer.current) { clearTimeout(syncTimer.current); syncTimer.current = null; }
+        setSyncStatus('syncing');
+        try {
+          // Push local first so anything we just changed is in Drive before the pull.
+          const localTasks = storage.get('tasks', []);
+          const localTombstones = storage.get('tombstones', {});
+          await DriveSync.save({
+            tasks: localTasks,
+            tombstones: localTombstones,
+            settings: storage.get('settings', DEFAULT_SETTINGS),
+            lastModified: Date.now(),
+          });
+          // Pull remote and merge — so changes from other devices appear immediately.
+          const remote = await DriveSync.load();
+          const remoteTasks = (remote && remote.tasks) || [];
+          const remoteTombstones = (remote && remote.tombstones) || {};
+          const { tasks: mergedTasks, tombstones: mergedTombstones } = mergeTasksAndTombstones(remoteTasks, localTasks, remoteTombstones, localTombstones);
+          setTasks(mergedTasks);
+          setTombstones(mergedTombstones);
+          if (remote && remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
+          const now = Date.now();
+          storage.set('lastSyncTime', now);
+          setLastSyncTime(now);
+          setSyncStatus('synced');
+        } catch (err) {
+          console.warn('Force sync failed', err);
+          setSyncStatus('error');
+        }
       };
 
       const refreshGCal = async () => {
@@ -1282,17 +1343,40 @@
                     )}
                   </>
                 )}
-                {syncStatus === 'disconnected' ? (
-                  <button onClick={connectGCal} disabled={gcalLoading}
-                    className="text-[10px] font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 transition-colors disabled:opacity-50"
-                    title="Drive sync is disconnected — changes aren't saving across devices. Click to reconnect.">
-                    {gcalLoading ? 'Reconnecting...' : '⚠ Disconnected — tap to reconnect'}
-                  </button>
-                ) : syncStatus && (
-                  <span className={`text-[10px] font-medium px-2 py-1 rounded-full ${syncStatus === 'syncing' ? 'text-gray-400 bg-gray-100' : syncStatus === 'synced' ? 'text-green-600 bg-green-50' : 'text-red-500 bg-red-50'}`}>
-                    {syncStatus === 'syncing' ? 'Syncing...' : syncStatus === 'synced' ? 'Synced' : 'Sync error'}
-                  </span>
-                )}
+                {(() => {
+                  // Always-on sync indicator. Clicking it does the right thing for the
+                  // current state: connect if not connected, force a full save+load+merge
+                  // if connected. Persistent so the user can always see sync state at a
+                  // glance — the old auto-clearing badge was too easy to miss on mobile.
+                  const connected = gcalConnected && initialSyncDone.current;
+                  let label, cls, disabled = false;
+                  if (syncStatus === 'syncing') {
+                    label = '↻ Syncing…';
+                    cls = 'text-gray-500 bg-gray-100 border-gray-200';
+                    disabled = true;
+                  } else if (syncStatus === 'error') {
+                    label = '⚠ Sync error · retry';
+                    cls = 'text-red-600 bg-red-50 border-red-200 hover:bg-red-100';
+                  } else if (syncStatus === 'disconnected' || (!connected && !gcalLoading)) {
+                    label = gcalLoading ? 'Connecting…' : '⚠ Disconnected · tap to connect';
+                    cls = 'text-amber-700 bg-amber-50 border-amber-200 hover:bg-amber-100';
+                    disabled = gcalLoading;
+                  } else if (gcalLoading) {
+                    label = 'Connecting…';
+                    cls = 'text-gray-500 bg-gray-100 border-gray-200';
+                    disabled = true;
+                  } else {
+                    label = `✓ Synced ${fmt.ago(lastSyncTime)}`;
+                    cls = 'text-green-700 bg-green-50 border-green-200 hover:bg-green-100';
+                  }
+                  return (
+                    <button onClick={forceSync} disabled={disabled}
+                      className={`text-[10px] font-medium px-2 py-1 rounded-full border transition-colors disabled:opacity-60 ${cls}`}
+                      title="Tap to force an immediate save + reload from Drive">
+                      {label}
+                    </button>
+                  );
+                })()}
                 <button onClick={() => { setEditingTask(null); setShowTaskModal(true); }}
                   className="px-3 py-1.5 text-sm font-medium bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors">
                   + Task
