@@ -368,8 +368,24 @@
         try {
           const fileId = await this._findFile();
           if (!fileId) return null;
-          const resp = await gapi.client.drive.files.get({ fileId, alt: 'media' });
-          return resp.result;
+          // Use raw fetch with cache: 'no-store' to bypass both browser HTTP cache and
+          // any caching in the gapi.client pipeline. We saw stale reads where one device's
+          // changes wouldn't appear on another for ~10 sync attempts — root cause was
+          // gapi returning a cached response. The cache-busting query param is belt-and-
+          // suspenders; the no-store header is what actually matters.
+          const token = gapi.client.getToken && gapi.client.getToken();
+          if (!token || !token.access_token) return null;
+          const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&_=${Date.now()}`;
+          const resp = await fetch(url, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${token.access_token}` },
+            cache: 'no-store',
+          });
+          if (!resp.ok) {
+            console.warn('DriveSync: load HTTP', resp.status);
+            return null;
+          }
+          return await resp.json();
         } catch (err) { console.warn('DriveSync: load error', err); return null; }
       },
 
@@ -1043,10 +1059,16 @@
         setGcalLoading(false);
       };
 
-      // Force an immediate Drive round-trip: save local state, reload remote, re-merge.
+      // Force an immediate Drive round-trip: pull remote, merge, push merged result.
       // Used by the sync indicator button so the user has a deterministic way to flush
       // pending changes and pull updates without waiting for the 2s debounce or hoping
       // the silent-auth retry-on-focus fires.
+      //
+      // ORDER MATTERS: load → merge → save. Doing save first would overwrite the other
+      // device's recent changes (including tombstones) before we'd had a chance to see
+      // them, then re-loading would just read back what we just clobbered. With pull-
+      // first, tombstones from the other device are honored by the merge and we never
+      // resurrect deleted tasks.
       const forceSync = async () => {
         // If we aren't connected (no auth or silent-auth never completed), kick the
         // manual connect flow — that handles auth + initial merge + initialSyncDone.
@@ -1058,23 +1080,24 @@
         if (syncTimer.current) { clearTimeout(syncTimer.current); syncTimer.current = null; }
         setSyncStatus('syncing');
         try {
-          // Push local first so anything we just changed is in Drive before the pull.
+          // 1. Pull remote.
+          const remote = await DriveSync.load();
           const localTasks = storage.get('tasks', []);
           const localTombstones = storage.get('tombstones', {});
-          await DriveSync.save({
-            tasks: localTasks,
-            tombstones: localTombstones,
-            settings: storage.get('settings', DEFAULT_SETTINGS),
-            lastModified: Date.now(),
-          });
-          // Pull remote and merge — so changes from other devices appear immediately.
-          const remote = await DriveSync.load();
           const remoteTasks = (remote && remote.tasks) || [];
           const remoteTombstones = (remote && remote.tombstones) || {};
+          // 2. Merge — per-task last-write-wins, tombstones honored from either side.
           const { tasks: mergedTasks, tombstones: mergedTombstones } = mergeTasksAndTombstones(remoteTasks, localTasks, remoteTombstones, localTombstones);
           setTasks(mergedTasks);
           setTombstones(mergedTombstones);
           if (remote && remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
+          // 3. Push the merged result so other devices see our local-only changes too.
+          await DriveSync.save({
+            tasks: mergedTasks,
+            tombstones: mergedTombstones,
+            settings: storage.get('settings', DEFAULT_SETTINGS),
+            lastModified: Date.now(),
+          });
           const now = Date.now();
           storage.set('lastSyncTime', now);
           setLastSyncTime(now);
