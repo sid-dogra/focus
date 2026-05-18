@@ -852,15 +852,18 @@
         };
       }, [gcalConnected]);
 
-      // Auto-unassign tasks whose date has passed
+      // Auto-unassign tasks whose date has passed.
+      // IMPORTANT: this is a local cleanup pass, NOT a user action — we deliberately
+      // do NOT bump updatedAt. Otherwise stale local tasks get freshly stamped on every
+      // app load, which makes them look newer than any tombstone from another device
+      // and causes deletes to silently fail to propagate.
       useEffect(() => {
         const todayLocal = new Date().toLocaleDateString('en-CA');
         const pastTasks = tasks.filter(t => t.status !== 'done' && t.assignedDate && t.assignedDate < todayLocal);
         if (pastTasks.length > 0) {
-          const now = Date.now();
           setTasks(prev => prev.map(t => {
             if (t.status !== 'done' && t.assignedDate && t.assignedDate < todayLocal) {
-              return { ...t, assignedDate: null, scheduledStart: null, scheduledEnd: null, scheduledDate: null, updatedAt: now };
+              return { ...t, assignedDate: null, scheduledStart: null, scheduledEnd: null, scheduledDate: null };
             }
             return t;
           }));
@@ -939,7 +942,13 @@
                     // Surface this loudly — see Bug 2: silent failure means phone diverges from desktop.
                     setGcalConnected(false);
                     setSyncStatus('disconnected');
-                    initialSyncDone.current = true;
+                    // IMPORTANT: do NOT set initialSyncDone here. If we do, the user
+                    // clicking "Reconnect" (which calls connectGCal) skips the Drive
+                    // merge because connectGCal guards merge behind !initialSyncDone.
+                    // Leaving it false means the manual reconnect performs the merge,
+                    // which is what we want — that's the whole point of reconnecting.
+                    // saveToDrive also early-returns when !gcalConnected, so leaving
+                    // the flag false here is safe.
                   });
                 } else {
                   initialSyncDone.current = true;
