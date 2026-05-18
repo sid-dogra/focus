@@ -397,6 +397,45 @@
       },
     };
 
+    // ===== SYNC MERGE =====
+    // Migration helper: older tasks may not have updatedAt — fall back to createdAt, then 0.
+    const taskTimestamp = (t) => {
+      if (typeof t.updatedAt === 'number') return t.updatedAt;
+      if (typeof t.createdAt === 'string') {
+        const n = Date.parse(t.createdAt);
+        return Number.isNaN(n) ? 0 : n;
+      }
+      return 0;
+    };
+    // Last-write-wins per task id, with tombstones honored on both sides.
+    // remoteTombstones / localTombstones: { [taskId]: deletedAtMs }
+    function mergeTasksAndTombstones(remoteTasks, localTasks, remoteTombstones, localTombstones) {
+      remoteTombstones = remoteTombstones || {};
+      localTombstones = localTombstones || {};
+      // Union of tombstones (latest wins per id)
+      const tombstones = { ...remoteTombstones };
+      for (const id in localTombstones) {
+        tombstones[id] = Math.max(tombstones[id] || 0, localTombstones[id]);
+      }
+      // Index tasks by id, picking the version with the newer updatedAt
+      const byId = new Map();
+      const consider = (t) => {
+        if (!t || !t.id) return;
+        const existing = byId.get(t.id);
+        if (!existing || taskTimestamp(t) > taskTimestamp(existing)) byId.set(t.id, t);
+      };
+      (remoteTasks || []).forEach(consider);
+      (localTasks || []).forEach(consider);
+      // Drop any task whose tombstone is newer than its updatedAt
+      const merged = [];
+      for (const t of byId.values()) {
+        const tomb = tombstones[t.id];
+        if (tomb && tomb >= taskTimestamp(t)) continue;
+        merged.push(t);
+      }
+      return { tasks: merged, tombstones };
+    }
+
     // ===== SCHEDULING ENGINE =====
     function generateSchedule(tasks, calendarEvents, date, settings) {
       const d = parseLocal(date);
@@ -734,7 +773,17 @@
 
     // ===== MAIN APP =====
     function App() {
-      const [tasks, setTasks] = useState(() => storage.get('tasks', []));
+      const [tasks, setTasks] = useState(() => {
+        // Migration: backfill updatedAt from createdAt (or now) so legacy tasks merge correctly.
+        const stored = storage.get('tasks', []);
+        const now = Date.now();
+        return stored.map(t => {
+          if (typeof t.updatedAt === 'number') return t;
+          const fallback = t.createdAt ? Date.parse(t.createdAt) : now;
+          return { ...t, updatedAt: Number.isNaN(fallback) ? now : fallback };
+        });
+      });
+      const [tombstones, setTombstones] = useState(() => storage.get('tombstones', {}));
       const [settings, setSettings] = useState(() => storage.get('settings', DEFAULT_SETTINGS));
       const [view, setView] = useState('calendar');
       const [calendarMode, setCalendarMode] = useState('day'); // day, week, month
@@ -750,33 +799,68 @@
       const [eventPopover, setEventPopover] = useState(null); // { event, x, y }
       const [dragState, setDragState] = useState(null); // { startMinutes, currentMinutes }
       const [showSlotPicker, setShowSlotPicker] = useState(null); // { startMinutes, endMinutes }
-      const [syncStatus, setSyncStatus] = useState(null); // null | 'syncing' | 'synced' | 'error'
+      const [syncStatus, setSyncStatus] = useState(null); // null | 'syncing' | 'synced' | 'error' | 'disconnected'
       const syncTimer = useRef(null);
       const initialSyncDone = useRef(false);
 
       // Persist locally
       useEffect(() => { storage.set('tasks', tasks); }, [tasks]);
+      useEffect(() => { storage.set('tombstones', tombstones); }, [tombstones]);
       useEffect(() => { storage.set('settings', settings); }, [settings]);
 
       // When app resumes (e.g. PWA re-opened next day), snap calendar to today
+      // AND retry silent re-auth if Drive sync is currently disconnected — this is the
+      // common iOS-PWA case where the page sat in the background long enough for the GIS
+      // token to expire. Surfacing the failure isn't enough; we also try to self-heal.
       useEffect(() => {
         const onFocus = () => {
           const today = new Date().toLocaleDateString('en-CA');
           setSelectedDate(prev => prev < today ? today : prev);
+          if (!gcalConnected && storage.get('gcal_connected', false) && window.gapi && window.google?.accounts?.oauth2) {
+            GCalService.authorize(false).then(async () => {
+              setGcalConnected(true);
+              setSyncStatus('syncing');
+              try {
+                const remote = await DriveSync.load();
+                const localTasks = storage.get('tasks', []);
+                const localTombstones = storage.get('tombstones', {});
+                const remoteTasks = (remote && remote.tasks) || [];
+                const remoteTombstones = (remote && remote.tombstones) || {};
+                const { tasks: mergedTasks, tombstones: mergedTombstones } = mergeTasksAndTombstones(remoteTasks, localTasks, remoteTombstones, localTombstones);
+                setTasks(mergedTasks);
+                setTombstones(mergedTombstones);
+                if (remote && remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
+                storage.set('lastSyncTime', Date.now());
+                setSyncStatus('synced');
+                setTimeout(() => setSyncStatus(prev => prev === 'synced' ? null : prev), 2000);
+              } catch (err) {
+                console.warn('Focus-retry sync load failed', err);
+                setSyncStatus('error');
+              }
+            }).catch(() => {
+              // Still can't get a token silently — leave the badge as 'disconnected'
+              setSyncStatus(prev => prev === 'disconnected' ? prev : 'disconnected');
+            });
+          }
         };
         window.addEventListener('focus', onFocus);
-        document.addEventListener('visibilitychange', () => { if (!document.hidden) onFocus(); });
-        return () => window.removeEventListener('focus', onFocus);
-      }, []);
+        const onVis = () => { if (!document.hidden) onFocus(); };
+        document.addEventListener('visibilitychange', onVis);
+        return () => {
+          window.removeEventListener('focus', onFocus);
+          document.removeEventListener('visibilitychange', onVis);
+        };
+      }, [gcalConnected]);
 
       // Auto-unassign tasks whose date has passed
       useEffect(() => {
         const todayLocal = new Date().toLocaleDateString('en-CA');
         const pastTasks = tasks.filter(t => t.status !== 'done' && t.assignedDate && t.assignedDate < todayLocal);
         if (pastTasks.length > 0) {
+          const now = Date.now();
           setTasks(prev => prev.map(t => {
             if (t.status !== 'done' && t.assignedDate && t.assignedDate < todayLocal) {
-              return { ...t, assignedDate: null, scheduledStart: null, scheduledEnd: null, scheduledDate: null };
+              return { ...t, assignedDate: null, scheduledStart: null, scheduledEnd: null, scheduledDate: null, updatedAt: now };
             }
             return t;
           }));
@@ -789,8 +873,9 @@
         if (syncTimer.current) clearTimeout(syncTimer.current);
         syncTimer.current = setTimeout(async () => {
           const localTasks = storage.get('tasks', []);
-          // SAFEGUARD: never overwrite Drive with empty tasks if Drive has data
-          if (localTasks.length === 0) {
+          const localTombstones = storage.get('tombstones', {});
+          // SAFEGUARD: never overwrite Drive with empty tasks if Drive has data and we have no tombstones to explain it
+          if (localTasks.length === 0 && Object.keys(localTombstones).length === 0) {
             try {
               const remote = await DriveSync.load();
               if (remote && remote.tasks && remote.tasks.length > 0) {
@@ -802,16 +887,17 @@
           setSyncStatus('syncing');
           const ok = await DriveSync.save({
             tasks: localTasks,
+            tombstones: localTombstones,
             settings: storage.get('settings', DEFAULT_SETTINGS),
             lastModified: Date.now(),
           });
           setSyncStatus(ok ? 'synced' : 'error');
-          if (ok) setTimeout(() => setSyncStatus(null), 2000);
+          if (ok) setTimeout(() => setSyncStatus(prev => prev === 'synced' ? null : prev), 2000);
         }, 2000);
       }, [gcalConnected]);
 
-      // Sync to Drive when tasks or settings change
-      useEffect(() => { saveToDrive(); }, [tasks, settings, saveToDrive]);
+      // Sync to Drive when tasks, tombstones, or settings change
+      useEffect(() => { saveToDrive(); }, [tasks, tombstones, settings, saveToDrive]);
 
       // Init Google Calendar and auto-connect
       useEffect(() => {
@@ -824,37 +910,35 @@
                 if (storage.get('gcal_connected', false)) {
                   GCalService.authorize(false).then(async () => {
                     setGcalConnected(true);
-                    // Load from Drive and merge (union merge — never lose data)
+                    // Load from Drive and merge (per-task last-write-wins, tombstones honored)
                     try {
                       setSyncStatus('syncing');
                       const remote = await DriveSync.load();
                       const localTasks = storage.get('tasks', []);
+                      const localTombstones = storage.get('tombstones', {});
                       const remoteTasks = (remote && remote.tasks) || [];
+                      const remoteTombstones = (remote && remote.tombstones) || {};
 
-                      if (remoteTasks.length > 0 || localTasks.length > 0) {
-                        // Union merge: combine both, remote wins on conflicts (by id)
-                        const remoteMap = new Map(remoteTasks.map(t => [t.id, t]));
-                        const localMap = new Map(localTasks.map(t => [t.id, t]));
-                        // Start with all remote tasks
-                        const merged = [...remoteTasks];
-                        // Add any local tasks not in remote
-                        localTasks.forEach(t => {
-                          if (!remoteMap.has(t.id)) merged.push(t);
-                        });
-                        setTasks(merged);
+                      if (remoteTasks.length > 0 || localTasks.length > 0 || Object.keys(remoteTombstones).length || Object.keys(localTombstones).length) {
+                        const { tasks: mergedTasks, tombstones: mergedTombstones } = mergeTasksAndTombstones(remoteTasks, localTasks, remoteTombstones, localTombstones);
+                        setTasks(mergedTasks);
+                        setTombstones(mergedTombstones);
                         if (remote && remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
                         storage.set('lastSyncTime', Date.now());
                       }
                       initialSyncDone.current = true;
                       setSyncStatus('synced');
-                      setTimeout(() => setSyncStatus(null), 2000);
+                      setTimeout(() => setSyncStatus(prev => prev === 'synced' ? null : prev), 2000);
                     } catch (err) {
                       console.warn('Drive sync load failed', err);
                       initialSyncDone.current = true;
-                      setSyncStatus(null);
+                      setSyncStatus('error');
                     }
                   }).catch(() => {
                     console.log('Auto-connect: silent auth failed, needs manual reconnect');
+                    // Surface this loudly — see Bug 2: silent failure means phone diverges from desktop.
+                    setGcalConnected(false);
+                    setSyncStatus('disconnected');
                     initialSyncDone.current = true;
                   });
                 } else {
@@ -874,21 +958,26 @@
         setTimeout(() => setNotification(null), 3000);
       };
 
-      // Task CRUD
+      // Task CRUD — every mutation stamps updatedAt so per-task last-write-wins merge works.
       const addTask = (task) => {
-        const newTask = { ...task, id: uid(), status: 'todo', createdAt: new Date().toISOString() };
+        const now = Date.now();
+        const newTask = { ...task, id: uid(), status: 'todo', createdAt: new Date().toISOString(), updatedAt: now };
         setTasks(prev => [newTask, ...prev]);
         notify('Task added');
       };
       const updateTask = (id, updates) => {
-        setTasks(prev => prev.map(t => t.id === id ? { ...t, ...updates } : t));
+        const now = Date.now();
+        setTasks(prev => prev.map(t => t.id === id ? { ...t, ...updates, updatedAt: now } : t));
       };
       const deleteTask = (id) => {
+        const now = Date.now();
         setTasks(prev => prev.filter(t => t.id !== id));
+        setTombstones(prev => ({ ...prev, [id]: now }));
         notify('Task deleted');
       };
       const toggleDone = (id) => {
-        setTasks(prev => prev.map(t => t.id === id ? { ...t, status: t.status === 'done' ? 'todo' : 'done' } : t));
+        const now = Date.now();
+        setTasks(prev => prev.map(t => t.id === id ? { ...t, status: t.status === 'done' ? 'todo' : 'done', updatedAt: now } : t));
       };
 
       // Google Calendar
@@ -901,17 +990,18 @@
           storage.set('gcal_last_fetch', Date.now());
           notify('Google Calendar connected!');
           await fetchEvents();
-          // Load from Drive on first manual connect (union merge — never lose data)
+          // Load from Drive on first manual connect (per-task last-write-wins, tombstones honored)
           if (!initialSyncDone.current) {
             try {
               const remote = await DriveSync.load();
               const localTasks = storage.get('tasks', []);
+              const localTombstones = storage.get('tombstones', {});
               const remoteTasks = (remote && remote.tasks) || [];
-              if (remoteTasks.length > 0 || localTasks.length > 0) {
-                const remoteMap = new Map(remoteTasks.map(t => [t.id, t]));
-                const merged = [...remoteTasks];
-                localTasks.forEach(t => { if (!remoteMap.has(t.id)) merged.push(t); });
-                setTasks(merged);
+              const remoteTombstones = (remote && remote.tombstones) || {};
+              if (remoteTasks.length > 0 || localTasks.length > 0 || Object.keys(remoteTombstones).length || Object.keys(localTombstones).length) {
+                const { tasks: mergedTasks, tombstones: mergedTombstones } = mergeTasksAndTombstones(remoteTasks, localTasks, remoteTombstones, localTombstones);
+                setTasks(mergedTasks);
+                setTombstones(mergedTombstones);
                 if (remote && remote.settings) setSettings(prev => ({ ...prev, ...remote.settings }));
                 if (remoteTasks.length > 0) notify('Synced data from cloud');
               }
@@ -1183,7 +1273,13 @@
                     )}
                   </>
                 )}
-                {syncStatus && (
+                {syncStatus === 'disconnected' ? (
+                  <button onClick={connectGCal} disabled={gcalLoading}
+                    className="text-[10px] font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 transition-colors disabled:opacity-50"
+                    title="Drive sync is disconnected — changes aren't saving across devices. Click to reconnect.">
+                    {gcalLoading ? 'Reconnecting...' : '⚠ Disconnected — tap to reconnect'}
+                  </button>
+                ) : syncStatus && (
                   <span className={`text-[10px] font-medium px-2 py-1 rounded-full ${syncStatus === 'syncing' ? 'text-gray-400 bg-gray-100' : syncStatus === 'synced' ? 'text-green-600 bg-green-50' : 'text-red-500 bg-red-50'}`}>
                     {syncStatus === 'syncing' ? 'Syncing...' : syncStatus === 'synced' ? 'Synced' : 'Sync error'}
                   </span>
