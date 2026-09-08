@@ -16,6 +16,7 @@ import {
   updateTaskDocument,
 } from './lib/firestore';
 import { formatDateTimeLocal, normalizeTask } from './lib/tasks';
+import CalendarConnectionNotice from './components/CalendarConnectionNotice';
 
     // ===== CONSTANTS =====
     const CATEGORIES = {
@@ -187,34 +188,46 @@ import { formatDateTimeLocal, normalizeTask } from './lib/tasks';
       _gapiReady: false,
       _gisReady: false,
 
-      init(clientId, onReady) {
+      init(clientId, onReady, onError) {
         if (!clientId) return;
+        let readyReported = false;
         const checkReady = () => {
-          if (this._gapiReady && this._gisReady && onReady) onReady();
+          if (this._gapiReady && this._gisReady && onReady && !readyReported) {
+            readyReported = true;
+            onReady();
+          }
         };
         // Init GAPI
         if (window.gapi) {
           gapi.load('client', async () => {
-            await gapi.client.init({});
-            await gapi.client.load('https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest');
-            this._gapiReady = true;
-            checkReady();
+            try {
+              await gapi.client.init({});
+              await gapi.client.load('https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest');
+              this._gapiReady = true;
+              checkReady();
+            } catch (error) {
+              onError?.(error);
+            }
           });
         }
         // Init GIS
         if (window.google?.accounts?.oauth2) {
-          this._tokenClient = google.accounts.oauth2.initTokenClient({
-            client_id: clientId,
-            scope: 'https://www.googleapis.com/auth/calendar',
-            callback: (resp) => {
-              if (resp.access_token) {
-                this._accessToken = resp.access_token;
-                gapi.client.setToken({ access_token: resp.access_token });
-              }
-            },
-          });
-          this._gisReady = true;
-          checkReady();
+          try {
+            this._tokenClient = google.accounts.oauth2.initTokenClient({
+              client_id: clientId,
+              scope: 'https://www.googleapis.com/auth/calendar',
+              callback: (resp) => {
+                if (resp.access_token) {
+                  this._accessToken = resp.access_token;
+                  gapi.client.setToken({ access_token: resp.access_token });
+                }
+              },
+            });
+            this._gisReady = true;
+            checkReady();
+          } catch (error) {
+            onError?.(error);
+          }
         }
       },
 
@@ -578,6 +591,9 @@ import { formatDateTimeLocal, normalizeTask } from './lib/tasks';
       const [editingTask, setEditingTask] = useState(null);
       const [calendarEvents, setCalendarEvents] = useState([]);
       const [gcalConnected, setGcalConnected] = useState(false);
+      const [gcalReady, setGcalReady] = useState(false);
+      const [gcalInitError, setGcalInitError] = useState('');
+      const [gcalPreviouslyConnected, setGcalPreviouslyConnected] = useState(() => storage.get('gcal_connected', false));
       const [gcalLoading, setGcalLoading] = useState(false);
       const [selectedDate, setSelectedDate] = useState(new Date().toLocaleDateString('en-CA'));
       const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -741,16 +757,49 @@ import { formatDateTimeLocal, normalizeTask } from './lib/tasks';
 
       // Google Calendar authorization is intentionally independent from task sync.
       useEffect(() => {
-        if (settings.googleClientId) {
-          const interval = setInterval(() => {
-            if (window.gapi && window.google?.accounts?.oauth2) {
-              clearInterval(interval);
-              GCalService.init(settings.googleClientId);
-            }
-          }, 500);
-          return () => clearInterval(interval);
-        }
-        return undefined;
+        setGcalReady(false);
+        setGcalInitError('');
+        if (!settings.googleClientId) return undefined;
+
+        let active = true;
+        let attempts = 0;
+        const initialize = () => {
+          attempts += 1;
+          if (window.gapi && window.google?.accounts?.oauth2) {
+            window.clearInterval(interval);
+            GCalService.init(
+              settings.googleClientId,
+              async () => {
+                if (!active) return;
+                setGcalReady(true);
+                if (!storage.get('gcal_connected', false)) return;
+
+                // Google Calendar tokens are short lived. Reuse the prior grant
+                // silently when the browser allows it; otherwise leave the
+                // reconnect notice visible so a user gesture can finish auth.
+                setGcalLoading(true);
+                try {
+                  await GCalService.authorize(false);
+                  if (active) setGcalConnected(true);
+                } catch {
+                  if (active) setGcalConnected(false);
+                } finally {
+                  if (active) setGcalLoading(false);
+                }
+              },
+              () => active && setGcalInitError('Google Calendar could not initialize. Check browser content blockers and try again.'),
+            );
+          } else if (attempts >= 40) {
+            window.clearInterval(interval);
+            if (active) setGcalInitError('Google Calendar scripts were blocked. Check browser content blockers and reload Focus.');
+          }
+        };
+        const interval = window.setInterval(initialize, 250);
+        initialize();
+        return () => {
+          active = false;
+          window.clearInterval(interval);
+        };
       }, [settings.googleClientId]);
 
       // Firestore writes update only one task document and are queued while offline.
@@ -805,17 +854,28 @@ import { formatDateTimeLocal, normalizeTask } from './lib/tasks';
 
       // Google Calendar
       const connectGCal = async () => {
+        if (!settings.googleClientId) {
+          setView('settings');
+          notify('Add your Google Calendar Client ID first.', 'error');
+          return;
+        }
+        if (!gcalReady) {
+          notify(gcalInitError || 'Google Calendar is still loading. Try again in a moment.', 'error');
+          return;
+        }
         setGcalLoading(true);
         try {
           await GCalService.authorize(!storage.get('gcal_connected', false));
           setGcalConnected(true);
+          setGcalPreviouslyConnected(true);
           storage.set('gcal_connected', true);
           storage.set('gcal_last_fetch', Date.now());
           notify('Google Calendar connected!');
           await fetchEvents();
         } catch (err) {
           setGcalConnected(false);
-          notify('Failed to connect: ' + err, 'error');
+          const message = err?.message || err?.error_description || err?.error || String(err);
+          notify('Calendar connection failed: ' + message, 'error');
         }
         setGcalLoading(false);
       };
@@ -1125,8 +1185,8 @@ import { formatDateTimeLocal, normalizeTask } from './lib/tasks';
                     mobileLabel = 'Offline';
                     cls = 'text-amber-700 bg-amber-50 border-amber-200 hover:bg-amber-100';
                   } else {
-                    label = `✓ Synced ${fmt.ago(lastSyncTime)}`;
-                    mobileLabel = '✓ Synced';
+                    label = `✓ Tasks synced ${fmt.ago(lastSyncTime)}`;
+                    mobileLabel = '✓ Tasks synced';
                     cls = 'text-green-700 bg-green-50 border-green-200 hover:bg-green-100';
                   }
                   return (
@@ -1161,6 +1221,17 @@ import { formatDateTimeLocal, normalizeTask } from './lib/tasks';
               )}
               {!tasksReady && (
                 <div className="mb-4 rounded-xl border border-gray-200 bg-white p-4 text-sm text-gray-500" role="status">Loading your cloud tasks…</div>
+              )}
+              {view === 'calendar' && !gcalConnected && (
+                <CalendarConnectionNotice
+                  error={gcalInitError}
+                  hasClientId={!!settings.googleClientId}
+                  loading={gcalLoading}
+                  onConnect={connectGCal}
+                  onOpenSettings={() => setView('settings')}
+                  previouslyConnected={gcalPreviouslyConnected}
+                  ready={gcalReady}
+                />
               )}
               {view === 'calendar' && calendarMode === 'day' && <TodayView tasks={tasks} schedule={schedule} calendarEvents={calendarEvents} selectedDate={selectedDate}
                 settings={settings} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}

@@ -29,6 +29,7 @@ export default defineConfig({
       workbox: {
         navigateFallback: '/focus/index.html',
         cleanupOutdatedCaches: true,
+        globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
         runtimeCaching: [
           {
             urlPattern: /^https:\/\/(?:accounts|apis)\.google\.com\//,
@@ -44,6 +45,6 @@ export default defineConfig({
   ],
   test: {
     environment: 'node',
-    include: ['src/**/*.test.js'],
+    include: ['src/**/*.test.{js,jsx}'],
   },
 });

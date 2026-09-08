@@ -75,4 +75,6 @@ Calendar access is optional and separate from Firebase login. Enter the Google O
 - `https://sid-dogra.github.io`
 - `http://localhost:5173` for development
 
+The browser Calendar token is intentionally not stored as a long-lived credential. After a reload or a new browser session, use the **Reconnect Calendar** notice in the Calendar view to load events again. Task sync remains connected through Firebase independently.
+
 Pushing a scheduled Focus task stores a private `focusTaskId` property on its calendar event. Later pushes update that event instead of creating another copy.

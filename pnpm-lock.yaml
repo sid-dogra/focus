@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@fontsource/inter':
+        specifier: 5.3.0
+        version: 5.3.0
       firebase:
         specifier: 12.18.0
         version: 12.18.0
@@ -776,6 +779,9 @@ packages:
 
   '@firebase/webchannel-wrapper@1.0.7':
     resolution: {integrity: sha512-phBFwieDLvkZGYN9CE9ZFNEIoBVksprzsnCzQejCmCHtgwCXReeuRpoEGN9C4EbhONztv8NRV1tau6Rb9pONwQ==}
+
+  '@fontsource/inter@5.3.0':
+    resolution: {integrity: sha512-RofMylZmjlJEfELXeNHFWBRcSs75rGU/6bV2S2jfnvv/3rPXPGe0LgUJTklcHZ9lM4OZmAVFhcJPnACfb91A3g==}
 
   '@grpc/grpc-js@1.9.16':
     resolution: {integrity: sha512-wE4Ut/olIzfKqp631XrG+wbF0v1vWFN4YL9FyXC2LJiG33DsV7PLzURjrCvY/6je2ntdRkeLpPDluzSRGaVltQ==}
@@ -3570,6 +3576,8 @@ snapshots:
       tslib: 2.8.1
 
   '@firebase/webchannel-wrapper@1.0.7': {}
+
+  '@fontsource/inter@5.3.0': {}
 
   '@grpc/grpc-js@1.9.16':
     dependencies:
