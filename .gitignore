@@ -1,0 +1,7 @@
+node_modules/
+.pnpm-store/
+dist/
+.firebase/
+.env
+.env.local
+.DS_Store

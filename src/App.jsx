@@ -1,0 +1,2550 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  observeAuth,
+  signInWithGoogle,
+  signOutUser,
+} from './lib/firebase';
+import {
+  createTaskDocument,
+  deleteTaskDocument,
+  getAllTaskDocuments,
+  importLegacyTasks,
+  retryCloudSync,
+  subscribeToSettings,
+  subscribeToTasks,
+  updateSettingsDocument,
+  updateTaskDocument,
+} from './lib/firestore';
+import { formatDateTimeLocal, normalizeTask } from './lib/tasks';
+
+    // ===== CONSTANTS =====
+    const CATEGORIES = {
+      research:  { label: 'Research',  color: '#7C3AED', light: '#EDE9FE', gcalColorId: '9' },
+      admin:     { label: 'Admin',     color: '#F59E0B', light: '#FEF3C7', gcalColorId: '5' },
+      startup:   { label: 'Startup',   color: '#10B981', light: '#D1FAE5', gcalColorId: '10' },
+      personal:  { label: 'Personal',  color: '#F43F5E', light: '#FFE4E6', gcalColorId: '6' },
+    };
+
+    const EFFORT = {
+      quick:  { label: 'Quick',  minutes: 15, icon: '⚡' },
+      medium: { label: 'Medium', minutes: 45, icon: '🔨' },
+      deep:   { label: 'Deep',   minutes: 120, icon: '🧠' },
+    };
+
+    const DEFAULT_SETTINGS = {
+      weekdayAvailableAfter: 17,
+      weekdayAvailableUntil: 22,
+      weekendAvailableAfter: 10,
+      weekendAvailableUntil: 22,
+      dangerZoneHours: 48,
+      googleClientId: '',
+      allowedEmails: ['dograsiddhant@gmail.com'],
+      softKeywords: ['contrast coverage'],
+      calendarRefreshMinutes: 30,
+      hiddenEventKeywords: ['radiology residency r2c2 didactic meeting'],
+      hiddenEventPrefixes: ['12pm', '8am'],
+      eventRenameRules: [{ match: '(no title)', replace: 'a2z Event' }],
+    };
+
+    // Auto-classify an event based on keyword rules
+    function classifyEvent(eventTitle, settings) {
+      const title = (eventTitle || '').toLowerCase();
+      const softKeywords = (settings.softKeywords || []);
+      for (const kw of softKeywords) {
+        if (kw && title.includes(kw.toLowerCase())) return 'soft';
+      }
+      return 'hard';
+    }
+
+    // Check if an event should be hidden
+    function shouldHideEvent(eventTitle, settings) {
+      const title = (eventTitle || '').toLowerCase();
+      for (const kw of (settings.hiddenEventKeywords || [])) {
+        if (kw && title.includes(kw.toLowerCase())) return true;
+      }
+      for (const prefix of (settings.hiddenEventPrefixes || [])) {
+        if (prefix && title.startsWith(prefix.toLowerCase())) return true;
+      }
+      return false;
+    }
+
+    // Apply rename rules to an event title
+    function renameEvent(eventTitle, settings) {
+      let title = eventTitle || '';
+      for (const rule of (settings.eventRenameRules || [])) {
+        if (rule.match && title.toLowerCase().includes(rule.match.toLowerCase())) {
+          title = rule.replace;
+        }
+      }
+      return title;
+    }
+
+    // ===== STORAGE =====
+    const storage = {
+      get: (key, fallback) => { try { const v = localStorage.getItem('focus_' + key); return v ? JSON.parse(v) : fallback; } catch { return fallback; } },
+      set: (key, value) => { try { localStorage.setItem('focus_' + key, JSON.stringify(value)); } catch {} },
+    };
+
+    // ===== DATE HELPERS =====
+    // Parse a YYYY-MM-DD string as LOCAL midnight (not UTC!)
+    const parseLocal = (str) => {
+      if (str instanceof Date) return new Date(str);
+      const [y, m, d] = str.split('-').map(Number);
+      return new Date(y, m - 1, d);
+    };
+    // Format a Date as YYYY-MM-DD in LOCAL timezone
+    const toDateStr = (d) => {
+      const dt = d instanceof Date ? d : parseLocal(d);
+      const y = dt.getFullYear();
+      const m = String(dt.getMonth() + 1).padStart(2, '0');
+      const day = String(dt.getDate()).padStart(2, '0');
+      return `${y}-${m}-${day}`;
+    };
+    const isWeekend = (d) => [0, 6].includes(parseLocal(d).getDay());
+    const fmt = {
+      date: (d) => parseLocal(d).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+      time: (d) => new Date(d).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
+      timeShort: (h, m = 0) => { const d = new Date(); d.setHours(h, m); return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }); },
+      relative: (d) => {
+        const now = new Date(), target = new Date(d);
+        const diff = Math.ceil((target - now) / (1000 * 60 * 60));
+        if (diff < 0) return 'Overdue';
+        if (diff < 24) return `${diff}h left`;
+        const days = Math.ceil(diff / 24);
+        return days === 1 ? 'Tomorrow' : `${days} days`;
+      },
+      // Compact relative-past for the sync indicator: 'just now' / '3m ago' / '2h ago' / '5d ago'.
+      ago: (ms) => {
+        if (!ms) return 'never';
+        const delta = Date.now() - ms;
+        if (delta < 60_000) return 'just now';
+        if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m ago`;
+        if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)}h ago`;
+        return `${Math.floor(delta / 86_400_000)}d ago`;
+      },
+    };
+
+    const timeToMinutes = (h, m = 0) => h * 60 + m;
+    const minutesToTime = (mins) => ({ h: Math.floor(mins / 60), m: mins % 60 });
+    const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const snapTo15 = (mins) => Math.round(mins / 15) * 15;
+
+    // ===== OVERLAP LAYOUT =====
+    // Groups overlapping items and assigns column/totalColumns so they render side-by-side
+    function layoutOverlaps(items) {
+      // items must have startMinutes and endMinutes
+      const sorted = [...items].sort((a, b) => a.startMinutes - b.startMinutes || a.endMinutes - b.endMinutes);
+      const groups = []; // each group is a set of overlapping items
+      let currentGroup = [];
+      let groupEnd = -1;
+
+      for (const item of sorted) {
+        if (currentGroup.length === 0 || item.startMinutes < groupEnd) {
+          currentGroup.push(item);
+          groupEnd = Math.max(groupEnd, item.endMinutes);
+        } else {
+          groups.push(currentGroup);
+          currentGroup = [item];
+          groupEnd = item.endMinutes;
+        }
+      }
+      if (currentGroup.length > 0) groups.push(currentGroup);
+
+      // Assign columns within each group
+      const layoutMap = new Map(); // id -> { col, totalCols }
+      for (const group of groups) {
+        const columns = [];
+        for (const item of group) {
+          let placed = false;
+          for (let c = 0; c < columns.length; c++) {
+            const lastInCol = columns[c];
+            if (item.startMinutes >= lastInCol.endMinutes) {
+              columns[c] = item;
+              layoutMap.set(item.id, { col: c, totalCols: 0 });
+              placed = true;
+              break;
+            }
+          }
+          if (!placed) {
+            layoutMap.set(item.id, { col: columns.length, totalCols: 0 });
+            columns.push(item);
+          }
+        }
+        // Set totalCols for all items in this group
+        const totalCols = columns.length;
+        for (const item of group) {
+          const info = layoutMap.get(item.id);
+          info.totalCols = totalCols;
+        }
+      }
+      return layoutMap;
+    }
+
+    // ===== GOOGLE CALENDAR SERVICE =====
+    const GCalService = {
+      _tokenClient: null,
+      _accessToken: null,
+      _gapiReady: false,
+      _gisReady: false,
+
+      init(clientId, onReady) {
+        if (!clientId) return;
+        const checkReady = () => {
+          if (this._gapiReady && this._gisReady && onReady) onReady();
+        };
+        // Init GAPI
+        if (window.gapi) {
+          gapi.load('client', async () => {
+            await gapi.client.init({});
+            await gapi.client.load('https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest');
+            this._gapiReady = true;
+            checkReady();
+          });
+        }
+        // Init GIS
+        if (window.google?.accounts?.oauth2) {
+          this._tokenClient = google.accounts.oauth2.initTokenClient({
+            client_id: clientId,
+            scope: 'https://www.googleapis.com/auth/calendar',
+            callback: (resp) => {
+              if (resp.access_token) {
+                this._accessToken = resp.access_token;
+                gapi.client.setToken({ access_token: resp.access_token });
+              }
+            },
+          });
+          this._gisReady = true;
+          checkReady();
+        }
+      },
+
+      async authorize(forceConsent = false) {
+        return new Promise((resolve, reject) => {
+          if (!this._tokenClient) return reject('Google not initialized');
+          this._tokenClient.callback = (resp) => {
+            if (resp.error) return reject(resp.error);
+            this._accessToken = resp.access_token;
+            gapi.client.setToken({ access_token: resp.access_token });
+            resolve(resp.access_token);
+          };
+          this._tokenClient.requestAccessToken({ prompt: forceConsent ? 'consent' : '' });
+        });
+      },
+
+      isAuthorized() { return !!this._accessToken; },
+
+      async listEvents(startDate, endDate) {
+        if (!this._accessToken) throw new Error('Not authorized');
+        // Fetch all visible calendars (primary + subscribed like Amion)
+        const calListResp = await gapi.client.calendar.calendarList.list({ showHidden: false });
+        const calendars = (calListResp.result.items || []).filter(c => c.selected !== false);
+
+        const allEvents = [];
+        for (const cal of calendars) {
+          try {
+            let pageToken;
+            do {
+              const resp = await gapi.client.calendar.events.list({
+                calendarId: cal.id,
+                timeMin: new Date(startDate).toISOString(),
+                timeMax: new Date(endDate).toISOString(),
+                singleEvents: true,
+                orderBy: 'startTime',
+                maxResults: 2500,
+                pageToken,
+              });
+              (resp.result.items || []).forEach(e => {
+                allEvents.push({
+                  id: `${cal.id}:${e.id}`,
+                  googleEventId: e.id,
+                  calendarId: cal.id,
+                  title: e.summary || '(No title)',
+                  start: e.start.dateTime || e.start.date,
+                  end: e.end.dateTime || e.end.date,
+                  allDay: !e.start.dateTime,
+                  source: 'google',
+                  calendarName: cal.summary || '',
+                });
+              });
+              pageToken = resp.result.nextPageToken;
+            } while (pageToken);
+          } catch (err) {
+            if (err?.status === 401 || err?.result?.error?.code === 401) throw err;
+            console.warn('Skipping calendar', cal.summary, err);
+          }
+        }
+        return allEvents;
+      },
+
+      async upsertTimeBlock(task, startDateTime, endDateTime) {
+        if (!this._accessToken) throw new Error('Not authorized');
+        const cat = CATEGORIES[task.category];
+        const resource = {
+          summary: `[Focus] ${task.title}`,
+          description: `Category: ${cat.label}\nEffort: ${EFFORT[task.effort].label}\n${task.notes || ''}`,
+          start: { dateTime: new Date(startDateTime).toISOString() },
+          end: { dateTime: new Date(endDateTime).toISOString() },
+          colorId: cat.gcalColorId,
+          extendedProperties: { private: { focusTaskId: task.id } },
+        };
+
+        let eventId = task.gcalEventId || null;
+        if (!eventId) {
+          const existing = await gapi.client.calendar.events.list({
+            calendarId: 'primary',
+            privateExtendedProperty: `focusTaskId=${task.id}`,
+            showDeleted: false,
+            singleEvents: true,
+            maxResults: 1,
+          });
+          eventId = existing.result.items?.[0]?.id || null;
+        }
+
+        if (eventId) {
+          try {
+            const updated = await gapi.client.calendar.events.update({
+              calendarId: 'primary',
+              eventId,
+              resource,
+            });
+            return updated.result;
+          } catch (error) {
+            if (error?.status !== 404 && error?.result?.error?.code !== 404) throw error;
+          }
+        }
+
+        const created = await gapi.client.calendar.events.insert({ calendarId: 'primary', resource });
+        return created.result;
+      },
+
+      async deleteTimeBlock(eventId) {
+        if (!this._accessToken) return;
+        await gapi.client.calendar.events.delete({ calendarId: 'primary', eventId });
+      },
+    };
+
+    // ===== SCHEDULING ENGINE =====
+    function generateSchedule(tasks, calendarEvents, date, settings) {
+      const d = parseLocal(date);
+      const weekend = isWeekend(d);
+      const availStart = weekend ? settings.weekendAvailableAfter : settings.weekdayAvailableAfter;
+      const availEnd = weekend ? settings.weekendAvailableUntil : settings.weekdayAvailableUntil;
+
+      // Check for academic time
+      const hasAcademic = calendarEvents.some(e => {
+        const cls = classifyEvent(e.title, settings);
+        return cls === 'academic';
+      });
+
+      let effectiveStart = availStart;
+      if (hasAcademic && !weekend) effectiveStart = 13; // Academic afternoon: open from 1 PM
+
+      // Build free windows
+      const dayStart = timeToMinutes(effectiveStart);
+      const dayEnd = timeToMinutes(availEnd);
+
+      // Get hard blocks within our available window
+      const hardBlocks = [];
+      const softBlocks = [];
+      calendarEvents.forEach(e => {
+        if (e.allDay) return;
+        const eStart = new Date(e.start);
+        const eEnd = new Date(e.end);
+        if (eStart.toDateString() !== d.toDateString()) return;
+
+        const startMins = timeToMinutes(eStart.getHours(), eStart.getMinutes());
+        const endMins = timeToMinutes(eEnd.getHours(), eEnd.getMinutes());
+        const cls = classifyEvent(e.title, settings);
+
+        if (cls === 'soft') {
+          softBlocks.push({ start: Math.max(startMins, dayStart), end: Math.min(endMins, dayEnd), event: e });
+        } else if (cls === 'hard' || cls === 'academic') {
+          hardBlocks.push({ start: Math.max(startMins, dayStart), end: Math.min(endMins, dayEnd), event: e });
+        }
+      });
+
+      // Treat manually-placed tasks as fixed blocks
+      const dateStr = d.toLocaleDateString('en-CA');
+      const manuallyPlaced = tasks.filter(t => t.status !== 'done' && t.scheduledDate === dateStr && t.scheduledStart != null && t.scheduledEnd != null);
+      const manualIds = new Set(manuallyPlaced.map(t => t.id));
+      const manualScheduled = [];
+      manuallyPlaced.forEach(t => {
+        hardBlocks.push({ start: Math.max(t.scheduledStart, dayStart), end: Math.min(t.scheduledEnd, dayEnd) });
+        manualScheduled.push({
+          id: `manual-${t.id}`,
+          taskId: t.id,
+          task: t,
+          startMinutes: t.scheduledStart,
+          endMinutes: t.scheduledEnd,
+          type: 'task',
+          manual: true,
+        });
+      });
+
+      hardBlocks.sort((a, b) => a.start - b.start);
+
+      // Calculate free windows (excluding hard blocks)
+      const freeWindows = [];
+      let cursor = dayStart;
+      for (const block of hardBlocks) {
+        if (block.start > cursor) freeWindows.push({ start: cursor, end: block.start });
+        cursor = Math.max(cursor, block.end);
+      }
+      if (cursor < dayEnd) freeWindows.push({ start: cursor, end: dayEnd });
+
+      // Only schedule tasks assigned to this day (plus overdue/urgent deadline tasks)
+      const now = new Date();
+      const dangerMs = settings.dangerZoneHours * 60 * 60 * 1000;
+      const incompleteTasks = tasks.filter(t => t.status !== 'done');
+      const assignedToday = incompleteTasks.filter(t => t.assignedDate === dateStr && !manualIds.has(t.id));
+
+      // Also include urgent/overdue deadline tasks even if not explicitly assigned (exclude manually placed)
+      const urgent = incompleteTasks.filter(t => !manualIds.has(t.id) && t.deadline && (new Date(t.deadline) - now) < dangerMs && (new Date(t.deadline) - now) > 0)
+        .sort((a, b) => new Date(a.deadline) - new Date(b.deadline));
+      const overdue = incompleteTasks.filter(t => !manualIds.has(t.id) && t.deadline && (new Date(t.deadline) - now) <= 0);
+
+      // Merge: assigned today + urgent/overdue (deduplicated)
+      const assignedIds = new Set(assignedToday.map(t => t.id));
+      const extraUrgent = [...overdue, ...urgent].filter(t => !assignedIds.has(t.id));
+      const todayPool = [...assignedToday, ...extraUrgent];
+
+      const remaining = todayPool.filter(t => !urgent.includes(t) && !overdue.includes(t));
+      const quick = remaining.filter(t => t.effort === 'quick').sort((a, b) => b.importance - a.importance);
+      const deep = remaining.filter(t => t.effort === 'deep').sort((a, b) => {
+        const aScore = a.importance * (a.deadline ? (1 + 1000 / Math.max(1, (new Date(a.deadline) - now) / 3600000)) : 1);
+        const bScore = b.importance * (b.deadline ? (1 + 1000 / Math.max(1, (new Date(b.deadline) - now) / 3600000)) : 1);
+        return bScore - aScore;
+      });
+      const medium = remaining.filter(t => t.effort === 'medium').sort((a, b) => {
+        const aScore = a.importance * (a.deadline ? (1 + 1000 / Math.max(1, (new Date(a.deadline) - now) / 3600000)) : 1);
+        const bScore = b.importance * (b.deadline ? (1 + 1000 / Math.max(1, (new Date(b.deadline) - now) / 3600000)) : 1);
+        return bScore - aScore;
+      });
+
+      // Schedule into windows
+      const scheduled = [];
+      let windowsCopy = freeWindows.map(w => ({ ...w }));
+
+      function placeTask(task) {
+        const dur = task.customMinutes || EFFORT[task.effort].minutes;
+        // Find best window (shortest that fits for quick/medium, longest for deep)
+        let bestIdx = -1;
+        if (task.effort === 'deep') {
+          let maxLen = 0;
+          windowsCopy.forEach((w, i) => { const len = w.end - w.start; if (len >= dur && len > maxLen) { maxLen = len; bestIdx = i; } });
+        } else {
+          let minLen = Infinity;
+          windowsCopy.forEach((w, i) => { const len = w.end - w.start; if (len >= dur && len < minLen) { minLen = len; bestIdx = i; } });
+        }
+
+        if (bestIdx === -1) return false;
+        const w = windowsCopy[bestIdx];
+        const startMin = w.start;
+        const endMin = startMin + dur;
+
+        scheduled.push({
+          id: uid(),
+          taskId: task.id,
+          task,
+          startMinutes: startMin,
+          endMinutes: endMin,
+          type: 'task',
+        });
+
+        // Shrink window
+        if (endMin >= w.end) {
+          windowsCopy.splice(bestIdx, 1);
+        } else {
+          windowsCopy[bestIdx] = { start: endMin, end: w.end };
+        }
+        return true;
+      }
+
+      // Place overdue first
+      overdue.forEach(t => placeTask(t));
+      // Place urgent
+      urgent.forEach(t => placeTask(t));
+      // Place quick wins as a batch
+      quick.forEach(t => placeTask(t));
+      // Place deep work
+      deep.forEach(t => placeTask(t));
+      // Place medium
+      medium.forEach(t => placeTask(t));
+
+      // Add soft block suggestions
+      softBlocks.forEach(sb => {
+        const quickForSoft = quick.filter(q => !scheduled.find(s => s.taskId === q.id));
+        quickForSoft.slice(0, 2).forEach(t => {
+          scheduled.push({
+            id: uid(),
+            taskId: t.id,
+            task: t,
+            startMinutes: sb.start,
+            endMinutes: Math.min(sb.start + (t.customMinutes || EFFORT[t.effort].minutes), sb.end),
+            type: 'soft-suggestion',
+            softEvent: sb.event,
+          });
+        });
+      });
+
+      // Add calendar events to the timeline
+      const eventBlocks = calendarEvents.filter(e => !e.allDay).map(e => {
+        const eStart = new Date(e.start);
+        const eEnd = new Date(e.end);
+        if (eStart.toDateString() !== d.toDateString()) return null;
+        const cls = classifyEvent(e.title, settings);
+        return {
+          id: e.id,
+          title: e.title,
+          startMinutes: timeToMinutes(eStart.getHours(), eStart.getMinutes()),
+          endMinutes: timeToMinutes(eEnd.getHours(), eEnd.getMinutes()),
+          type: 'event',
+          classification: cls,
+          event: e,
+        };
+      }).filter(Boolean);
+
+      return { scheduled: [...scheduled, ...manualScheduled, ...eventBlocks].sort((a, b) => a.startMinutes - b.startMinutes), freeWindows, overdue, urgent };
+    }
+
+    // ===== AUTH GATE =====
+    function AuthGate({ children }) {
+      const [user, setUser] = useState(null);
+      const [loading, setLoading] = useState(true);
+      const [signInLoading, setSignInLoading] = useState(false);
+      const [error, setError] = useState('');
+
+      useEffect(() => observeAuth((nextUser) => {
+        setUser(nextUser);
+        setLoading(false);
+      }, (authError) => {
+        setError(authError?.message || 'Google sign-in failed.');
+        setLoading(false);
+      }), []);
+
+      const handleSignIn = async () => {
+        setSignInLoading(true);
+        setError('');
+        try {
+          await signInWithGoogle();
+        } catch (authError) {
+          if (authError?.code !== 'auth/popup-closed-by-user') {
+            setError(authError?.message || 'Google sign-in failed.');
+          }
+        } finally {
+          setSignInLoading(false);
+        }
+      };
+
+      if (loading) {
+        return (
+          <div className="min-h-dvh flex items-center justify-center bg-gray-50">
+            <div className="text-center" role="status">
+              <div className="w-12 h-12 bg-violet-600 rounded-xl flex items-center justify-center text-white text-xl font-bold mx-auto mb-4">F</div>
+              <div className="text-sm text-gray-500">Opening Focus…</div>
+            </div>
+          </div>
+        );
+      }
+
+      if (user) return React.cloneElement(children, { user });
+
+      return (
+        <div className="min-h-dvh flex items-center justify-center bg-gray-50 p-4 safe-top safe-bottom">
+          <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-8 w-full max-w-sm text-center">
+            <div className="w-14 h-14 bg-violet-600 rounded-xl flex items-center justify-center text-white text-2xl font-bold mx-auto mb-4">F</div>
+            <h1 className="text-xl font-bold text-gray-900 mb-1">Focus</h1>
+            <p className="text-sm text-gray-500 mb-6">Sign in once to keep your phone and browser in sync.</p>
+            <button onClick={handleSignIn} disabled={signInLoading}
+              className="w-full min-h-11 px-4 py-2.5 text-sm font-medium bg-white border border-gray-300 rounded-lg hover:bg-gray-50 text-gray-700 transition-colors flex items-center justify-center gap-2 disabled:opacity-60">
+              <svg aria-hidden="true" width="18" height="18" viewBox="0 0 48 48"><path fill="#4285F4" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#34A853" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#EA4335" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+              {signInLoading ? 'Signing in…' : 'Continue with Google'}
+            </button>
+            {error && <p className="text-sm text-red-600 mt-4" role="alert">{error}</p>}
+            <p className="text-xs text-gray-400 mt-4">Only your authorized Google account can access this database.</p>
+          </div>
+        </div>
+      );
+    }
+
+    // ===== MAIN APP =====
+    function App({ user }) {
+      const legacyTasks = useMemo(() => storage.get('tasks', []).map(task => normalizeTask(task)), []);
+      const [tasks, setTasks] = useState([]);
+      const [settings, setSettings] = useState(() => storage.get('settings', DEFAULT_SETTINGS));
+      const [view, setView] = useState('calendar');
+      const [calendarMode, setCalendarMode] = useState('day'); // day, week, month
+      const [showTaskModal, setShowTaskModal] = useState(false);
+      const [editingTask, setEditingTask] = useState(null);
+      const [calendarEvents, setCalendarEvents] = useState([]);
+      const [gcalConnected, setGcalConnected] = useState(false);
+      const [gcalLoading, setGcalLoading] = useState(false);
+      const [selectedDate, setSelectedDate] = useState(new Date().toLocaleDateString('en-CA'));
+      const [sidebarOpen, setSidebarOpen] = useState(false);
+      const [schedule, setSchedule] = useState(null);
+      const [notification, setNotification] = useState(null);
+      const [eventPopover, setEventPopover] = useState(null); // { event, x, y }
+      const [dragState, setDragState] = useState(null); // { startMinutes, currentMinutes }
+      const [showSlotPicker, setShowSlotPicker] = useState(null); // { startMinutes, endMinutes }
+      const [syncStatus, setSyncStatus] = useState('connecting'); // connecting | pending | synced | offline | error
+      const [lastSyncTime, setLastSyncTime] = useState(() => storage.get('lastSyncTime', 0));
+      const [tasksReady, setTasksReady] = useState(false);
+      const [settingsReady, setSettingsReady] = useState(false);
+      const [taskSyncMeta, setTaskSyncMeta] = useState({ fromCache: true, hasPendingWrites: false });
+      const [settingsSyncMeta, setSettingsSyncMeta] = useState({ fromCache: true, hasPendingWrites: false });
+      const [online, setOnline] = useState(() => navigator.onLine);
+      const [migrationComplete, setMigrationComplete] = useState(() => storage.get('firestore_migrated_v1', false));
+      const [migrationLoading, setMigrationLoading] = useState(false);
+      const settingsSaveTimer = useRef(null);
+      const lastCloudSettings = useRef('');
+      const migratedSettings = useRef(false);
+
+      const notify = useCallback((msg, type = 'success') => {
+        setNotification({ msg, type });
+        window.setTimeout(() => setNotification(null), 3000);
+      }, []);
+
+      // Firestore listeners are the source of truth. They emit local writes immediately,
+      // then emit again when the server acknowledges them.
+      useEffect(() => {
+        setTasksReady(false);
+        setSettingsReady(false);
+        setSyncStatus(navigator.onLine ? 'connecting' : 'offline');
+
+        const stopTasks = subscribeToTasks(user.uid, (nextTasks, metadata) => {
+          setTasks(nextTasks);
+          setTaskSyncMeta(metadata);
+          setTasksReady(true);
+        }, (error) => {
+          console.error('Task sync failed', error);
+          setSyncStatus('error');
+          notify('Task sync failed. Check Firestore rules.', 'error');
+        });
+
+        const stopSettings = subscribeToSettings(user.uid, (cloudSettings, metadata) => {
+          const localSettings = storage.get('settings', DEFAULT_SETTINGS);
+          const nextSettings = cloudSettings
+            ? { ...DEFAULT_SETTINGS, ...cloudSettings }
+            : { ...DEFAULT_SETTINGS, ...localSettings };
+          delete nextSettings.updatedAtServer;
+          delete nextSettings.schemaVersion;
+          lastCloudSettings.current = JSON.stringify(nextSettings);
+          setSettings(nextSettings);
+          setSettingsSyncMeta(metadata);
+          setSettingsReady(true);
+
+          // A customized legacy settings record is safe to migrate automatically;
+          // an empty fresh phone never creates a blank cloud settings document.
+          const hasLegacySettings = !!localSettings.googleClientId
+            || JSON.stringify(localSettings) !== JSON.stringify(DEFAULT_SETTINGS);
+          if (!cloudSettings && hasLegacySettings && !migratedSettings.current) {
+            migratedSettings.current = true;
+            updateSettingsDocument(user.uid, nextSettings).catch((error) => {
+              console.error('Settings migration failed', error);
+              setSyncStatus('error');
+            });
+          }
+        }, (error) => {
+          console.error('Settings sync failed', error);
+          setSyncStatus('error');
+          notify('Settings sync failed. Check Firestore rules.', 'error');
+        });
+
+        return () => {
+          stopTasks();
+          stopSettings();
+        };
+      }, [notify, user.uid]);
+
+      // Persist settings to Firestore after local edits without echoing listener updates.
+      useEffect(() => {
+        storage.set('settings', settings);
+        if (!settingsReady) return undefined;
+        const serialized = JSON.stringify(settings);
+        if (serialized === lastCloudSettings.current) return undefined;
+        if (settingsSaveTimer.current) window.clearTimeout(settingsSaveTimer.current);
+        setSyncStatus(online ? 'pending' : 'offline');
+        settingsSaveTimer.current = window.setTimeout(async () => {
+          try {
+            await updateSettingsDocument(user.uid, settings);
+          } catch (error) {
+            console.error('Settings save failed', error);
+            setSyncStatus('error');
+          }
+        }, 500);
+        return () => window.clearTimeout(settingsSaveTimer.current);
+      }, [online, settings, settingsReady, user.uid]);
+
+      // Derive an honest status from connectivity and Firestore acknowledgement metadata.
+      useEffect(() => {
+        const handleOnline = () => setOnline(true);
+        const handleOffline = () => setOnline(false);
+        window.addEventListener('online', handleOnline);
+        window.addEventListener('offline', handleOffline);
+        return () => {
+          window.removeEventListener('online', handleOnline);
+          window.removeEventListener('offline', handleOffline);
+        };
+      }, []);
+
+      useEffect(() => {
+        if (!online) {
+          setSyncStatus('offline');
+          return;
+        }
+        if (!tasksReady || !settingsReady) {
+          setSyncStatus('connecting');
+          return;
+        }
+        if (taskSyncMeta.hasPendingWrites || settingsSyncMeta.hasPendingWrites) {
+          setSyncStatus('pending');
+          return;
+        }
+        setSyncStatus('synced');
+        if (!taskSyncMeta.fromCache || !settingsSyncMeta.fromCache) {
+          const now = Date.now();
+          setLastSyncTime(now);
+          storage.set('lastSyncTime', now);
+        }
+      }, [online, settingsReady, settingsSyncMeta, taskSyncMeta, tasksReady]);
+
+      // When a suspended PWA resumes on a later day, move the calendar to today.
+      useEffect(() => {
+        const onFocus = () => {
+          const today = new Date().toLocaleDateString('en-CA');
+          setSelectedDate(prev => prev < today ? today : prev);
+        };
+        window.addEventListener('focus', onFocus);
+        const onVis = () => { if (!document.hidden) onFocus(); };
+        document.addEventListener('visibilitychange', onVis);
+        return () => {
+          window.removeEventListener('focus', onFocus);
+          document.removeEventListener('visibilitychange', onVis);
+        };
+      }, []);
+
+      // Auto-unassign past tasks with field-level writes so another field edited on a
+      // second device is never overwritten by cleanup.
+      useEffect(() => {
+        if (!tasksReady) return;
+        const todayLocal = new Date().toLocaleDateString('en-CA');
+        const pastTasks = tasks.filter(t => t.status !== 'done' && t.assignedDate && t.assignedDate < todayLocal);
+        pastTasks.forEach(task => {
+          updateTaskDocument(user.uid, task.id, {
+            assignedDate: null,
+            scheduledStart: null,
+            scheduledEnd: null,
+            scheduledDate: null,
+          }).catch(error => console.error('Past-task cleanup failed', error));
+        });
+      }, [tasks, tasksReady, user.uid]);
+
+      // Google Calendar authorization is intentionally independent from task sync.
+      useEffect(() => {
+        if (settings.googleClientId) {
+          const interval = setInterval(() => {
+            if (window.gapi && window.google?.accounts?.oauth2) {
+              clearInterval(interval);
+              GCalService.init(settings.googleClientId);
+            }
+          }, 500);
+          return () => clearInterval(interval);
+        }
+        return undefined;
+      }, [settings.googleClientId]);
+
+      // Firestore writes update only one task document and are queued while offline.
+      const addTask = async (task) => {
+        const now = Date.now();
+        const newTask = normalizeTask({ ...task, id: uid(), status: 'todo', createdAt: new Date().toISOString(), updatedAt: now });
+        try {
+          await createTaskDocument(user.uid, newTask);
+          notify(online ? 'Task added' : 'Task saved offline');
+        } catch (error) {
+          console.error('Task creation failed', error);
+          notify('Task could not be saved', 'error');
+        }
+      };
+      const updateTask = async (id, updates) => {
+        try {
+          await updateTaskDocument(user.uid, id, updates);
+        } catch (error) {
+          console.error('Task update failed', error);
+          notify('Task could not be updated', 'error');
+        }
+      };
+      const deleteTask = async (id) => {
+        try {
+          await deleteTaskDocument(user.uid, id);
+          notify('Task deleted');
+        } catch (error) {
+          console.error('Task deletion failed', error);
+          notify('Task could not be deleted', 'error');
+        }
+      };
+      const toggleDone = (id) => {
+        const task = tasks.find(item => item.id === id);
+        if (task) updateTask(id, { status: task.status === 'done' ? 'todo' : 'done' });
+      };
+
+      const migrateLegacyData = async () => {
+        setMigrationLoading(true);
+        try {
+          const result = await importLegacyTasks(user.uid, legacyTasks);
+          await updateSettingsDocument(user.uid, settings);
+          storage.set('firestore_migrated_v1', true);
+          setMigrationComplete(true);
+          notify(`Moved ${result.imported} task${result.imported === 1 ? '' : 's'} to cloud sync`);
+        } catch (error) {
+          console.error('Legacy migration failed', error);
+          notify('Legacy task migration failed', 'error');
+        } finally {
+          setMigrationLoading(false);
+        }
+      };
+
+      // Google Calendar
+      const connectGCal = async () => {
+        setGcalLoading(true);
+        try {
+          await GCalService.authorize(!storage.get('gcal_connected', false));
+          setGcalConnected(true);
+          storage.set('gcal_connected', true);
+          storage.set('gcal_last_fetch', Date.now());
+          notify('Google Calendar connected!');
+          await fetchEvents();
+        } catch (err) {
+          setGcalConnected(false);
+          notify('Failed to connect: ' + err, 'error');
+        }
+        setGcalLoading(false);
+      };
+
+      const forceSync = async () => {
+        if (!navigator.onLine) {
+          setSyncStatus('offline');
+          notify('You are offline. Changes will sync automatically.', 'error');
+          return;
+        }
+        setSyncStatus('connecting');
+        try {
+          await retryCloudSync();
+        } catch (error) {
+          console.error('Sync retry failed', error);
+          setSyncStatus('error');
+        }
+      };
+
+      const refreshGCal = async () => {
+        setGcalLoading(true);
+        try {
+          await fetchEvents();
+          storage.set('gcal_last_fetch', Date.now());
+          notify('Calendar refreshed!');
+        } catch (err) {
+          notify('Failed to refresh: ' + err, 'error');
+        }
+        setGcalLoading(false);
+      };
+
+      const fetchEvents = async () => {
+        try {
+          const start = parseLocal(selectedDate);
+          const end = parseLocal(selectedDate);
+          if (calendarMode === 'month') {
+            start.setDate(1); start.setDate(start.getDate() - 7);
+            end.setMonth(end.getMonth() + 1, 7);
+          } else if (calendarMode === 'week') {
+            const dow = start.getDay();
+            start.setDate(start.getDate() - (dow === 0 ? 6 : dow - 1));
+            end.setDate(start.getDate() + 8);
+          } else {
+            start.setDate(start.getDate() - 1);
+            end.setDate(end.getDate() + 2);
+          }
+          const rawEvents = await GCalService.listEvents(start, end);
+          // Filter hidden events and apply rename rules
+          const events = rawEvents
+            .filter(e => !shouldHideEvent(e.title, settings))
+            .map(e => ({ ...e, title: renameEvent(e.title, settings) }));
+          setCalendarEvents(events);
+        } catch (err) {
+          console.error('Fetch events error:', err);
+          if (err?.status === 401 || err?.result?.error?.code === 401) {
+            setGcalConnected(false);
+          }
+          throw err;
+        }
+      };
+
+      useEffect(() => {
+        if (gcalConnected) {
+          fetchEvents().catch(() => {});
+          storage.set('gcal_last_fetch', Date.now());
+        }
+      }, [selectedDate, gcalConnected, calendarMode]);
+
+      // Auto-refresh calendar on interval
+      useEffect(() => {
+        if (!gcalConnected) return;
+        const refreshMs = (settings.calendarRefreshMinutes || 30) * 60 * 1000;
+        const timer = setInterval(() => {
+          fetchEvents().then(() => {
+            storage.set('gcal_last_fetch', Date.now());
+          }).catch(() => {});
+        }, refreshMs);
+        return () => clearInterval(timer);
+      }, [gcalConnected, settings.calendarRefreshMinutes, calendarMode, selectedDate]);
+
+      // Auto-schedule
+      const runAutoSchedule = () => {
+        const result = generateSchedule(tasks, calendarEvents, selectedDate, settings);
+        setSchedule(result);
+        notify(`Scheduled ${result.scheduled.filter(s => s.type === 'task').length} tasks`);
+      };
+
+      // Cancel a task from the schedule
+      const cancelScheduledTask = (taskId) => {
+        if (!schedule) return;
+        const scheduledBlock = schedule.scheduled.find(s => (
+          (s.type === 'task' || s.type === 'soft-suggestion')
+          && s.task?.id === taskId
+        ));
+        setSchedule(prev => ({
+          ...prev,
+          scheduled: prev.scheduled.filter(s => !(s.type === 'task' && s.task && s.task.id === taskId) && !(s.type === 'soft-suggestion' && s.task && s.task.id === taskId)),
+        }));
+        if (scheduledBlock?.manual) {
+          updateTask(taskId, {
+            assignedDate: null,
+            scheduledStart: null,
+            scheduledEnd: null,
+            scheduledDate: null,
+          });
+        }
+        notify('Task removed from schedule');
+      };
+
+      // Assign existing task to a time slot
+      const assignTaskToSlot = (taskId, startMins, endMins) => {
+        updateTask(taskId, { scheduledStart: startMins, scheduledEnd: endMins, scheduledDate: selectedDate, assignedDate: selectedDate });
+        setShowSlotPicker(null);
+        notify('Task placed on calendar');
+      };
+
+      // Open TaskModal pre-filled for a new task from drag
+      const createTaskFromSlot = (startMins, endMins) => {
+        const dur = endMins - startMins;
+        setEditingTask(null);
+        setShowSlotPicker(null);
+        setShowTaskModal(true);
+        // Store slot info for TaskModal to pick up
+        setDragState({ slotStart: startMins, slotEnd: endMins, slotDate: selectedDate, slotDuration: dur });
+      };
+
+      // Push to Google Calendar
+      const pushToGCal = async () => {
+        if (!gcalConnected || !schedule) return;
+        setGcalLoading(true);
+        try {
+          const taskBlocks = schedule.scheduled.filter(s => s.type === 'task');
+          const dateBase = parseLocal(selectedDate);
+          for (const block of taskBlocks) {
+            const { h: sh, m: sm } = minutesToTime(block.startMinutes);
+            const { h: eh, m: em } = minutesToTime(block.endMinutes);
+            const start = new Date(dateBase); start.setHours(sh, sm, 0, 0);
+            const end = new Date(dateBase); end.setHours(eh, em, 0, 0);
+            const event = await GCalService.upsertTimeBlock(block.task, start, end);
+            if (event?.id && event.id !== block.task.gcalEventId) {
+              await updateTaskDocument(user.uid, block.task.id, { gcalEventId: event.id });
+            }
+          }
+          notify(`Pushed ${taskBlocks.length} blocks to Google Calendar!`);
+          await fetchEvents();
+        } catch (err) {
+          notify('Failed to push: ' + err, 'error');
+        }
+        setGcalLoading(false);
+      };
+
+      // PWA install prompt
+      const [installPrompt, setInstallPrompt] = useState(null);
+      useEffect(() => {
+        const handler = (e) => { e.preventDefault(); setInstallPrompt(e); };
+        window.addEventListener('beforeinstallprompt', handler);
+        return () => window.removeEventListener('beforeinstallprompt', handler);
+      }, []);
+      const handleInstall = async () => {
+        if (!installPrompt) return;
+        installPrompt.prompt();
+        const result = await installPrompt.userChoice;
+        if (result.outcome === 'accepted') { setInstallPrompt(null); notify('App installed!'); }
+      };
+
+      // Stats
+      const stats = useMemo(() => {
+        const done = tasks.filter(t => t.status === 'done').length;
+        const total = tasks.length;
+        const overdue = tasks.filter(t => t.deadline && new Date(t.deadline) < new Date() && t.status !== 'done').length;
+        const upcoming = tasks.filter(t => t.deadline && t.status !== 'done')
+          .sort((a, b) => new Date(a.deadline) - new Date(b.deadline)).slice(0, 3);
+        return { done, total, overdue, upcoming };
+      }, [tasks]);
+
+      return (
+        <div className="flex h-dvh overflow-hidden">
+          {/* Mobile overlay */}
+          {sidebarOpen && <div className="fixed inset-0 bg-black/30 z-40 md:hidden" onClick={() => setSidebarOpen(false)} />}
+
+          {/* Sidebar */}
+          <aside className={`sidebar ${sidebarOpen ? 'open' : ''} w-64 bg-white border-r border-gray-200 flex flex-col md:relative md:translate-x-0`}>
+            <div className="p-5 border-b border-gray-100">
+              <h1 className="text-xl font-bold text-gray-900 flex items-center gap-2">
+                <span className="w-8 h-8 bg-violet-600 rounded-lg flex items-center justify-center text-white text-sm font-bold">F</span>
+                Focus
+              </h1>
+            </div>
+            <nav className="flex-1 p-3 space-y-1">
+              {[
+                { id: 'calendar', label: 'Calendar', icon: '📅' },
+                { id: 'tasks', label: 'Tasks', icon: '📋' },
+                { id: 'settings', label: 'Settings', icon: '⚙️' },
+              ].map(item => (
+                <button key={item.id} onClick={() => { setView(item.id); setSidebarOpen(false); }}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${view === item.id ? 'bg-violet-50 text-violet-700' : 'text-gray-600 hover:bg-gray-50'}`}>
+                  <span>{item.icon}</span> {item.label}
+                </button>
+              ))}
+            </nav>
+            <div className="p-4 border-t border-gray-100">
+              {installPrompt && (
+                <button onClick={handleInstall}
+                  className="w-full mb-3 px-3 py-2 text-xs font-medium bg-violet-50 text-violet-700 rounded-lg hover:bg-violet-100 transition-colors">
+                  Install as App
+                </button>
+              )}
+              <div className="mt-3 pt-3 border-t border-gray-100 flex items-center justify-between">
+                <span className="text-xs text-gray-400 truncate">{user.email}</span>
+                <button onClick={() => signOutUser()}
+                  className="min-h-9 text-xs text-gray-500 hover:text-red-500 ml-2 flex-shrink-0">Sign out</button>
+              </div>
+            </div>
+          </aside>
+
+          {/* Main */}
+          <main className="flex-1 flex flex-col overflow-hidden">
+            {/* Header */}
+            <header className="safe-top bg-white border-b border-gray-200 px-3 md:px-6 py-2.5 md:py-3 flex flex-wrap md:flex-nowrap items-center gap-2 justify-between flex-shrink-0">
+              <div className="flex min-w-0 flex-1 items-center gap-1 md:gap-3">
+                <button onClick={() => setSidebarOpen(true)} aria-label="Open navigation" className="md:hidden min-w-11 min-h-11 p-2 text-gray-500 hover:bg-gray-100 rounded-lg flex items-center justify-center">
+                  <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h14M3 10h14M3 14h14"/></svg>
+                </button>
+                {view === 'calendar' && (
+                  <>
+                    {/* Date nav arrows */}
+                    <button onClick={() => {
+                      const d = parseLocal(selectedDate);
+                      if (calendarMode === 'day') d.setDate(d.getDate() - 1);
+                      else if (calendarMode === 'week') d.setDate(d.getDate() - 7);
+                      else d.setMonth(d.getMonth() - 1);
+                      setSelectedDate(d.toLocaleDateString('en-CA')); setSchedule(null);
+                    }} aria-label="Previous date" className="min-w-9 min-h-9 p-1 text-gray-500 hover:text-gray-700 rounded text-lg">‹</button>
+                    <button onClick={() => { setSelectedDate(new Date().toLocaleDateString('en-CA')); setSchedule(null); }}
+                      className="min-h-9 px-2 text-xs font-medium text-violet-600 bg-violet-50 rounded-full hover:bg-violet-100">Today</button>
+                    <button onClick={() => {
+                      const d = parseLocal(selectedDate);
+                      if (calendarMode === 'day') d.setDate(d.getDate() + 1);
+                      else if (calendarMode === 'week') d.setDate(d.getDate() + 7);
+                      else d.setMonth(d.getMonth() + 1);
+                      setSelectedDate(d.toLocaleDateString('en-CA')); setSchedule(null);
+                    }} aria-label="Next date" className="min-w-9 min-h-9 p-1 text-gray-500 hover:text-gray-700 rounded text-lg">›</button>
+                    <h2 className="min-w-0 truncate text-sm sm:text-base md:text-lg font-semibold text-gray-900 ml-1">
+                      {calendarMode === 'day' ? fmt.date(selectedDate)
+                        : calendarMode === 'week' ? (() => {
+                          const d = parseLocal(selectedDate); const day = d.getDay();
+                          const mon = new Date(d); mon.setDate(d.getDate() - (day === 0 ? 6 : day - 1));
+                          const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+                          return `${mon.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${sun.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
+                        })()
+                        : parseLocal(selectedDate).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                    </h2>
+                  </>
+                )}
+                {view !== 'calendar' && (
+                  <h2 className="text-lg font-semibold text-gray-900">
+                    {view === 'tasks' ? 'Tasks' : 'Settings'}
+                  </h2>
+                )}
+              </div>
+              <div className="flex w-full md:w-auto flex-wrap items-center gap-2">
+                {view === 'calendar' && (
+                  <>
+                    {/* Day / Week / Month toggle */}
+                    <div className="flex bg-gray-100 rounded-lg p-0.5">
+                      {[['day', 'Day'], ['week', 'Week'], ['month', 'Month']].map(([mode, label]) => (
+                        <button key={mode} onClick={() => setCalendarMode(mode)}
+                          className={`min-h-9 px-3 py-1 text-xs font-medium rounded-md transition-colors ${calendarMode === mode ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                    {calendarMode === 'day' && (
+                      <>
+                        <button onClick={runAutoSchedule}
+                          className="min-h-9 px-3 py-1.5 text-sm font-medium bg-violet-600 text-white rounded-lg hover:bg-violet-700 transition-colors">
+                          Plan My Day
+                        </button>
+                        {gcalConnected && schedule && (
+                          <button onClick={pushToGCal} disabled={gcalLoading}
+                            className="min-h-9 px-3 py-1.5 text-sm font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-colors disabled:opacity-50">
+                            {gcalLoading ? '...' : 'Push to GCal'}
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </>
+                )}
+                {(() => {
+                  let label, mobileLabel, cls, disabled = false;
+                  if (syncStatus === 'connecting') {
+                    label = '↻ Connecting to cloud…';
+                    mobileLabel = '↻ Connecting…';
+                    cls = 'text-gray-500 bg-gray-100 border-gray-200';
+                    disabled = true;
+                  } else if (syncStatus === 'pending') {
+                    label = '↻ Saving changes…';
+                    mobileLabel = '↻ Saving…';
+                    cls = 'text-violet-700 bg-violet-50 border-violet-200';
+                    disabled = true;
+                  } else if (syncStatus === 'error') {
+                    label = '⚠ Sync error · retry';
+                    mobileLabel = '⚠ Retry sync';
+                    cls = 'text-red-600 bg-red-50 border-red-200 hover:bg-red-100';
+                  } else if (syncStatus === 'offline') {
+                    label = 'Offline · changes saved on this device';
+                    mobileLabel = 'Offline';
+                    cls = 'text-amber-700 bg-amber-50 border-amber-200 hover:bg-amber-100';
+                  } else {
+                    label = `✓ Synced ${fmt.ago(lastSyncTime)}`;
+                    mobileLabel = '✓ Synced';
+                    cls = 'text-green-700 bg-green-50 border-green-200 hover:bg-green-100';
+                  }
+                  return (
+                    <button onClick={forceSync} disabled={disabled}
+                      className={`min-h-9 text-[10px] font-medium px-2 py-1 rounded-full border transition-colors disabled:opacity-60 ${cls}`}
+                      title="Firestore sync status">
+                      <span className="sm:hidden">{mobileLabel}</span>
+                      <span className="hidden sm:inline">{label}</span>
+                    </button>
+                  );
+                })()}
+                <button onClick={() => { setEditingTask(null); setShowTaskModal(true); }}
+                  className="min-h-9 ml-auto md:ml-0 px-3 py-1.5 text-sm font-medium bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors">
+                  + Task
+                </button>
+              </div>
+            </header>
+
+            {/* Content */}
+            <div className="flex-1 overflow-y-auto p-4 md:p-6">
+              {!migrationComplete && legacyTasks.length > 0 && (
+                <div className="mb-4 flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-violet-200 bg-violet-50 p-4">
+                  <div className="flex-1">
+                    <h3 className="text-sm font-semibold text-violet-900">Move your existing tasks to cloud sync</h3>
+                    <p className="mt-1 text-xs text-violet-700">Found {legacyTasks.length} task{legacyTasks.length === 1 ? '' : 's'} from the previous version on this device. The original copy will be kept as a backup.</p>
+                  </div>
+                  <button onClick={migrateLegacyData} disabled={migrationLoading}
+                    className="min-h-11 shrink-0 rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium text-white hover:bg-violet-700 disabled:opacity-60">
+                    {migrationLoading ? 'Moving tasks…' : 'Move tasks'}
+                  </button>
+                </div>
+              )}
+              {!tasksReady && (
+                <div className="mb-4 rounded-xl border border-gray-200 bg-white p-4 text-sm text-gray-500" role="status">Loading your cloud tasks…</div>
+              )}
+              {view === 'calendar' && calendarMode === 'day' && <TodayView tasks={tasks} schedule={schedule} calendarEvents={calendarEvents} selectedDate={selectedDate}
+                settings={settings} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
+                onEventClick={(block, ev) => setEventPopover({ event: block, x: ev.clientX, y: ev.clientY })}
+                dragState={dragState} onDragChange={setDragState}
+                onSlotSelected={(startMinutes, endMinutes) => setShowSlotPicker({ startMinutes, endMinutes })} />}
+              {view === 'calendar' && calendarMode === 'week' && <WeekView tasks={tasks} calendarEvents={calendarEvents} selectedDate={selectedDate} settings={settings}
+                toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
+                onDayClick={(d) => { setSelectedDate(d); setCalendarMode('day'); }}
+                onEventClick={(block, ev) => setEventPopover({ event: block, x: ev.clientX, y: ev.clientY })} />}
+              {view === 'calendar' && calendarMode === 'month' && <MonthView tasks={tasks} calendarEvents={calendarEvents} selectedDate={selectedDate}
+                settings={settings} toggleDone={toggleDone} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }}
+                onDayClick={(d) => { setSelectedDate(d); setCalendarMode('day'); }} />}
+              {view === 'tasks' && <AllTasksView tasks={tasks} toggleDone={toggleDone} deleteTask={deleteTask}
+                updateTask={updateTask} onEdit={(t) => { setEditingTask(t); setShowTaskModal(true); }} />}
+              {view === 'settings' && <SettingsView settings={settings} setSettings={setSettings} gcalConnected={gcalConnected}
+                connectGCal={connectGCal} refreshGCal={refreshGCal} gcalLoading={gcalLoading}
+                tasks={tasks} user={user} notify={notify} />}
+            </div>
+          </main>
+
+          {/* Slot Picker */}
+          {showSlotPicker && <SlotPicker slot={showSlotPicker} tasks={tasks}
+            onAssignExisting={assignTaskToSlot}
+            onCreateNew={createTaskFromSlot}
+            onClose={() => setShowSlotPicker(null)} />}
+
+          {/* Task Modal */}
+          {showTaskModal && <TaskModal task={editingTask}
+            slotInfo={dragState && dragState.slotStart != null ? dragState : null}
+            onSave={(t) => {
+              if (editingTask) {
+                updateTask(editingTask.id, t);
+              } else {
+                addTask(t);
+              }
+              setShowTaskModal(false);
+              setDragState(null);
+            }}
+            onClose={() => { setShowTaskModal(false); setDragState(null); }}
+            onRemoveFromSchedule={schedule && editingTask && schedule.scheduled.some(s => (s.type === 'task' || s.type === 'soft-suggestion') && s.task && s.task.id === editingTask.id) ? cancelScheduledTask : null} />}
+
+          {/* Event Popover */}
+          {eventPopover && (() => {
+            const ep = eventPopover.event;
+            const startTime = ep.startMinutes != null
+              ? fmt.timeShort(Math.floor(ep.startMinutes / 60), ep.startMinutes % 60)
+              : ep.start ? fmt.time(ep.start) : '';
+            const endTime = ep.endMinutes != null
+              ? fmt.timeShort(Math.floor(ep.endMinutes / 60), ep.endMinutes % 60)
+              : ep.end ? fmt.time(ep.end) : '';
+            const cls = ep.classification || classifyEvent(ep.title, settings);
+            const clsColors = cls === 'soft'
+              ? { bg: '#F3F4F6', border: '#D1D5DB', text: '#4B5563', label: 'Soft / Available' }
+              : cls === 'academic'
+              ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9', label: 'Academic' }
+              : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8', label: 'Hard Block' };
+            const popLeft = Math.min(eventPopover.x, window.innerWidth - 280);
+            const popTop = Math.min(eventPopover.y + 8, window.innerHeight - 160);
+            return (
+              <div className="fixed inset-0 z-50" onClick={() => setEventPopover(null)} onKeyDown={(e) => e.key === 'Escape' && setEventPopover(null)}>
+                <div className="absolute bg-white rounded-lg shadow-xl border border-gray-200 w-64 p-3" style={{ left: popLeft, top: popTop }} onClick={(e) => e.stopPropagation()}>
+                  <div className="flex items-start justify-between mb-1">
+                    <div className="font-semibold text-sm text-gray-900 leading-snug pr-2">{ep.title}</div>
+                    <button onClick={() => setEventPopover(null)} className="text-gray-400 hover:text-gray-600 text-lg leading-none">&times;</button>
+                  </div>
+                  <div className="text-xs text-gray-500 mb-1.5">{startTime} – {endTime}</div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full" style={{ backgroundColor: clsColors.border }} />
+                    <span className="text-xs" style={{ color: clsColors.text }}>{clsColors.label}</span>
+                  </div>
+                  {(ep.calendarName || (ep.event && ep.event.calendarName)) && <div className="text-xs text-gray-400 mt-1.5">📅 {ep.calendarName || ep.event.calendarName}</div>}
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Notification */}
+          {notification && (
+            <div className={`fixed bottom-4 right-4 px-4 py-2.5 rounded-lg text-sm font-medium shadow-lg fade-in z-50 ${notification.type === 'error' ? 'bg-red-500 text-white' : 'bg-gray-900 text-white'}`}>
+              {notification.msg}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ===== TODAY VIEW =====
+    function TodayView({ tasks, schedule, calendarEvents, selectedDate, settings, toggleDone, onEdit, onEventClick, dragState, onDragChange, onSlotSelected }) {
+      const timelineRef = useRef(null);
+      const incompleteTasks = tasks.filter(t => t.status !== 'done');
+      const now = new Date();
+      const dangerMs = settings.dangerZoneHours * 60 * 60 * 1000;
+
+      const overdue = incompleteTasks.filter(t => t.deadline && new Date(t.deadline) < now);
+      const urgent = incompleteTasks.filter(t => t.deadline && !overdue.includes(t) && (new Date(t.deadline) - now) < dangerMs);
+      const quickWins = incompleteTasks.filter(t => t.effort === 'quick' && !overdue.includes(t) && !urgent.includes(t));
+
+      const weekend = isWeekend(selectedDate);
+      const availStartHour = weekend ? settings.weekendAvailableAfter : settings.weekdayAvailableAfter;
+      const availEndHour = weekend ? settings.weekendAvailableUntil : settings.weekdayAvailableUntil;
+      // Show full 24-hour day
+      const displayStartHour = 0;
+      const displayEndHour = 24;
+      const hours = Array.from({ length: displayEndHour - displayStartHour }, (_, i) => displayStartHour + i);
+
+      return (
+        <div className="space-y-6 fade-in">
+          {/* Alerts */}
+          {overdue.length > 0 && (
+            <div className="bg-red-50 border border-red-200 rounded-xl p-4">
+              <h3 className="text-sm font-semibold text-red-700 mb-2">Overdue ({overdue.length})</h3>
+              <div className="space-y-2">
+                {overdue.map(t => <MiniTaskCard key={t.id} task={t} toggleDone={toggleDone} onEdit={onEdit} />)}
+              </div>
+            </div>
+          )}
+
+          {urgent.length > 0 && (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+              <h3 className="text-sm font-semibold text-amber-700 mb-2">Due Soon ({urgent.length})</h3>
+              <div className="space-y-2">
+                {urgent.map(t => <MiniTaskCard key={t.id} task={t} toggleDone={toggleDone} onEdit={onEdit} />)}
+              </div>
+            </div>
+          )}
+
+          {/* Quick Wins */}
+          {quickWins.length > 0 && !schedule && (
+            <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
+              <h3 className="text-sm font-semibold text-blue-700 mb-2">Quick Wins ({quickWins.length})</h3>
+              <div className="space-y-2">
+                {quickWins.slice(0, 5).map(t => <MiniTaskCard key={t.id} task={t} toggleDone={toggleDone} onEdit={onEdit} />)}
+              </div>
+            </div>
+          )}
+
+          {/* Timeline */}
+          {(() => {
+            const HOUR_HEIGHT = 60; // px per hour
+            const totalHeight = 24 * HOUR_HEIGHT;
+            const dayStartMins = displayStartHour * 60;
+
+            // Build all blocks to display
+            const dateStr = selectedDate;
+            const allBlocks = [];
+            if (schedule) {
+              schedule.scheduled.forEach(s => allBlocks.push(s));
+            } else {
+              calendarEvents.forEach(e => {
+                if (e.allDay) return;
+                const es = new Date(e.start);
+                if (es.toDateString() !== parseLocal(selectedDate).toDateString()) return;
+                allBlocks.push({
+                  id: e.id,
+                  title: e.title,
+                  type: 'event',
+                  classification: classifyEvent(e.title, settings),
+                  startMinutes: timeToMinutes(es.getHours(), es.getMinutes()),
+                  endMinutes: timeToMinutes(new Date(e.end).getHours(), new Date(e.end).getMinutes()),
+                  event: e,
+                });
+              });
+              // Also show manually-placed tasks
+              tasks.filter(t => t.status !== 'done' && t.scheduledDate === dateStr && t.scheduledStart != null && t.scheduledEnd != null).forEach(t => {
+                allBlocks.push({
+                  id: `manual-${t.id}`,
+                  taskId: t.id,
+                  task: t,
+                  startMinutes: t.scheduledStart,
+                  endMinutes: t.scheduledEnd,
+                  type: 'task',
+                  manual: true,
+                });
+              });
+            }
+
+            return (
+              <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+                <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-gray-700">
+                    {schedule ? 'Scheduled Plan' : 'Timeline'}
+                  </h3>
+                  {!schedule && <span className="text-xs text-gray-400"><span className="sm:hidden">Tap a time to place a task</span><span className="hidden sm:inline">Drag to place tasks · or “Plan My Day”</span></span>}
+                </div>
+                <div className="relative" style={{ display: 'grid', gridTemplateColumns: '60px 1fr' }}>
+                  {/* Hour labels + grid lines */}
+                  <div style={{ height: totalHeight }} className="relative">
+                    {hours.map(hour => {
+                      const isAvail = hour >= availStartHour && hour < availEndHour;
+                      return (
+                        <div key={hour} className={`absolute w-full px-2 text-xs text-right font-medium ${isAvail ? 'text-violet-400' : 'text-gray-300'}`}
+                          style={{ top: (hour - displayStartHour) * HOUR_HEIGHT, height: HOUR_HEIGHT, paddingTop: 4 }}>
+                          {fmt.timeShort(hour)}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {/* Blocks area */}
+                  <div className="relative select-none" style={{ height: totalHeight }} ref={timelineRef}
+                    onMouseDown={(e) => {
+                      if (e.target !== e.currentTarget && !e.target.classList.contains('hour-grid-line')) return;
+                      e.preventDefault();
+                      const rect = timelineRef.current.getBoundingClientRect();
+                      const offsetY = e.clientY - rect.top;
+                      const startMins = Math.max(0, Math.min(1440, snapTo15(dayStartMins + (offsetY / HOUR_HEIGHT) * 60)));
+                      let currentMins = startMins;
+                      onDragChange && onDragChange({ startMinutes: startMins, currentMinutes: startMins });
+                      const handleMove = (me) => {
+                        const oy = me.clientY - rect.top;
+                        currentMins = Math.max(0, Math.min(1440, snapTo15(dayStartMins + (oy / HOUR_HEIGHT) * 60)));
+                        onDragChange && onDragChange({ startMinutes: startMins, currentMinutes: currentMins });
+                      };
+                      const handleUp = () => {
+                        document.removeEventListener('mousemove', handleMove);
+                        document.removeEventListener('mouseup', handleUp);
+                        onDragChange && onDragChange(null);
+                        const slotStart = Math.min(startMins, currentMins);
+                        const slotEnd = Math.max(startMins, currentMins);
+                        if (slotEnd - slotStart >= 15) onSlotSelected?.(slotStart, slotEnd);
+                      };
+                      document.addEventListener('mousemove', handleMove);
+                      document.addEventListener('mouseup', handleUp);
+                    }}
+                    onClick={(e) => {
+                      if (!window.matchMedia('(pointer: coarse)').matches) return;
+                      if (e.target !== e.currentTarget && !e.target.classList.contains('hour-grid-line')) return;
+                      const rect = timelineRef.current.getBoundingClientRect();
+                      const offsetY = e.clientY - rect.top;
+                      const slotStart = Math.max(0, Math.min(1425, snapTo15(dayStartMins + (offsetY / HOUR_HEIGHT) * 60)));
+                      onSlotSelected?.(slotStart, Math.min(1440, slotStart + 30));
+                    }}>
+                    {/* Hour grid lines + available shading */}
+                    {hours.map(hour => {
+                      const isAvail = hour >= availStartHour && hour < availEndHour;
+                      return (
+                        <div key={hour} className={`hour-grid-line absolute w-full border-t border-gray-100 ${!isAvail ? 'bg-gray-50/50' : ''}`}
+                          style={{ top: (hour - displayStartHour) * HOUR_HEIGHT, height: HOUR_HEIGHT }} />
+                      );
+                    })}
+                    {/* Positioned blocks with overlap layout */}
+                    {(() => {
+                      const overlapLayout = layoutOverlaps(allBlocks);
+                      return allBlocks.map(block => {
+                        const top = ((block.startMinutes - dayStartMins) / 60) * HOUR_HEIGHT;
+                        const height = Math.max(((block.endMinutes - block.startMinutes) / 60) * HOUR_HEIGHT, 20);
+                        const layout = overlapLayout.get(block.id) || { col: 0, totalCols: 1 };
+                        const widthPct = 100 / layout.totalCols;
+                        const leftPct = layout.col * widthPct;
+
+                        if (block.type === 'event') {
+                          const cls = block.classification;
+                          const colors = cls === 'soft'
+                            ? { bg: '#F3F4F6', border: '#D1D5DB', text: '#4B5563' }
+                            : cls === 'academic'
+                            ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9' }
+                            : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8' };
+                          return (
+                            <div key={block.id} className="absolute rounded-md px-2 py-1 text-xs font-medium overflow-hidden z-10 cursor-pointer hover:brightness-95"
+                              style={{ top, height: height - 2, left: `calc(${leftPct}% + 4px)`, width: `calc(${widthPct}% - 8px)`, backgroundColor: colors.bg, borderLeft: `3px solid ${colors.border}`, color: colors.text }}
+                              onClick={(ev) => onEventClick && onEventClick(block, ev)}>
+                              <div className="truncate">{block.title}</div>
+                              {height > 30 && <div className="text-[10px] opacity-60">{fmt.timeShort(Math.floor(block.startMinutes/60), block.startMinutes%60)} – {fmt.timeShort(Math.floor(block.endMinutes/60), block.endMinutes%60)}</div>}
+                              {cls === 'soft' && <span className="text-[10px] opacity-50">(available)</span>}
+                            </div>
+                          );
+                        }
+                        if (block.type === 'task' || block.type === 'soft-suggestion') {
+                          const cat = CATEGORIES[block.task.category];
+                          const dur = block.endMinutes - block.startMinutes;
+                          return (
+                            <div key={block.id} className="absolute rounded-md px-2 py-1 text-xs font-medium overflow-hidden cursor-pointer hover:opacity-80 z-10"
+                              style={{ top, height: height - 2, left: `calc(${leftPct}% + 4px)`, width: `calc(${widthPct}% - 8px)`, backgroundColor: cat.light, borderLeft: `3px solid ${cat.color}` }}
+                              onClick={() => onEdit(block.task)}>
+                              <div className="truncate">{block.task.title}</div>
+                              {height > 30 && <div className="text-[10px] opacity-60">{dur}m · {fmt.timeShort(Math.floor(block.startMinutes/60), block.startMinutes%60)}</div>}
+                              {block.type === 'soft-suggestion' && <span className="text-[10px] opacity-50">💡</span>}
+                            </div>
+                          );
+                        }
+                        return null;
+                      });
+                    })()}
+                    {/* Drag preview */}
+                    {dragState && (() => {
+                      const dStart = Math.min(dragState.startMinutes, dragState.currentMinutes);
+                      const dEnd = Math.max(dragState.startMinutes, dragState.currentMinutes);
+                      const dTop = ((dStart - dayStartMins) / 60) * HOUR_HEIGHT;
+                      const dHeight = Math.max(((dEnd - dStart) / 60) * HOUR_HEIGHT, 15);
+                      return (
+                        <div className="absolute left-1 right-1 bg-violet-200/60 border-2 border-violet-400 border-dashed rounded-md pointer-events-none z-30 flex items-start px-2 py-1"
+                          style={{ top: dTop, height: dHeight }}>
+                          <span className="text-xs font-medium text-violet-700">
+                            {fmt.timeShort(Math.floor(dStart / 60), dStart % 60)} – {fmt.timeShort(Math.floor(dEnd / 60), dEnd % 60)}
+                          </span>
+                        </div>
+                      );
+                    })()}
+                    {/* Current time indicator */}
+                    {parseLocal(selectedDate).toDateString() === new Date().toDateString() && (() => {
+                      const nowMins = timeToMinutes(new Date().getHours(), new Date().getMinutes());
+                      const top = ((nowMins - dayStartMins) / 60) * HOUR_HEIGHT;
+                      return (
+                        <div className="absolute left-0 right-0 z-20 flex items-center" style={{ top }}>
+                          <div className="w-2 h-2 bg-red-500 rounded-full -ml-1" />
+                          <div className="flex-1 h-px bg-red-500" />
+                        </div>
+                      );
+                    })()}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Unscheduled tasks */}
+          {schedule && (() => {
+            const scheduledIds = new Set(schedule.scheduled.filter(s => s.taskId).map(s => s.taskId));
+            const unscheduled = incompleteTasks.filter(t => !scheduledIds.has(t.id));
+            if (unscheduled.length === 0) return null;
+            return (
+              <div className="bg-gray-50 rounded-xl border border-gray-200 p-4">
+                <h3 className="text-sm font-semibold text-gray-600 mb-2">Couldn't fit today ({unscheduled.length})</h3>
+                <div className="space-y-2">
+                  {unscheduled.slice(0, 8).map(t => <MiniTaskCard key={t.id} task={t} toggleDone={toggleDone} onEdit={onEdit} />)}
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      );
+    }
+
+    // ===== WEEK VIEW =====
+    function WeekView({ tasks, calendarEvents, selectedDate, settings, toggleDone, onEdit, onDayClick, onEventClick }) {
+      const weekStart = parseLocal(selectedDate);
+      const dayOfWeek = weekStart.getDay();
+      weekStart.setDate(weekStart.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
+
+      const days = Array.from({ length: 7 }, (_, i) => {
+        const d = new Date(weekStart);
+        d.setDate(d.getDate() + i);
+        return d;
+      });
+
+      const HOUR_HEIGHT = 40;
+      const hours = Array.from({ length: 24 }, (_, i) => i);
+      const totalHeight = 24 * HOUR_HEIGHT;
+      const todayStr = new Date().toLocaleDateString('en-CA');
+
+      return (
+        <div className="fade-in bg-white rounded-xl border border-gray-200 overflow-hidden">
+          {/* Day headers */}
+          <div className="grid border-b border-gray-200 sticky top-0 bg-white z-20" style={{ gridTemplateColumns: '50px repeat(7, 1fr)' }}>
+            <div className="border-r border-gray-100" />
+            {days.map(d => {
+              const dateStr = d.toLocaleDateString('en-CA');
+              const isToday = dateStr === todayStr;
+              return (
+                <div key={dateStr} className={`px-1 py-2 text-center border-r border-gray-100 cursor-pointer hover:bg-gray-50 ${isToday ? 'bg-violet-50' : ''}`}
+                  onClick={() => onDayClick && onDayClick(dateStr)}>
+                  <div className={`text-[10px] font-medium uppercase ${isToday ? 'text-violet-600' : 'text-gray-400'}`}>
+                    {d.toLocaleDateString('en-US', { weekday: 'short' })}
+                  </div>
+                  <div className={`text-sm font-semibold ${isToday ? 'text-white bg-violet-600 w-7 h-7 rounded-full flex items-center justify-center mx-auto' : 'text-gray-700'}`}>
+                    {d.getDate()}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {/* Time grid */}
+          <div className="overflow-y-auto" style={{ maxHeight: 'calc(100vh - 200px)' }}>
+            <div className="grid relative" style={{ gridTemplateColumns: '50px repeat(7, 1fr)', height: totalHeight }}>
+              {/* Hour labels */}
+              <div className="relative border-r border-gray-100">
+                {hours.map(h => (
+                  <div key={h} className="absolute w-full px-1 text-[10px] text-gray-300 text-right font-medium"
+                    style={{ top: h * HOUR_HEIGHT, height: HOUR_HEIGHT, paddingTop: 2 }}>
+                    {h > 0 ? fmt.timeShort(h) : ''}
+                  </div>
+                ))}
+              </div>
+              {/* Day columns */}
+              {days.map((d, dayIdx) => {
+                const dateStr = d.toLocaleDateString('en-CA');
+                const dayEvents = calendarEvents.filter(e => {
+                  if (e.allDay) return false;
+                  return new Date(e.start).toDateString() === d.toDateString();
+                });
+
+                return (
+                  <div key={dateStr} className="relative border-r border-gray-100">
+                    {/* Hour lines */}
+                    {hours.map(h => (
+                      <div key={h} className="absolute w-full border-t border-gray-50"
+                        style={{ top: h * HOUR_HEIGHT, height: HOUR_HEIGHT }} />
+                    ))}
+                    {/* Events with overlap layout */}
+                    {(() => {
+                      const eventsWithMins = dayEvents.map(e => {
+                        const es = new Date(e.start);
+                        const ee = new Date(e.end);
+                        return { ...e, startMinutes: timeToMinutes(es.getHours(), es.getMinutes()), endMinutes: timeToMinutes(ee.getHours(), ee.getMinutes()) };
+                      });
+                      const overlapLayout = layoutOverlaps(eventsWithMins);
+                      return eventsWithMins.map(e => {
+                        const top = (e.startMinutes / 60) * HOUR_HEIGHT;
+                        const height = Math.max(((e.endMinutes - e.startMinutes) / 60) * HOUR_HEIGHT, 16);
+                        const layout = overlapLayout.get(e.id) || { col: 0, totalCols: 1 };
+                        const widthPct = 100 / layout.totalCols;
+                        const leftPct = layout.col * widthPct;
+                        const cls = classifyEvent(e.title, settings);
+                        const colors = cls === 'soft'
+                          ? { bg: '#F3F4F6', border: '#D1D5DB', text: '#4B5563' }
+                          : cls === 'academic'
+                          ? { bg: '#EDE9FE', border: '#A78BFA', text: '#6D28D9' }
+                          : { bg: '#DBEAFE', border: '#93C5FD', text: '#1D4ED8' };
+                        return (
+                          <div key={e.id} className="absolute rounded px-1 py-0.5 text-[10px] font-medium overflow-hidden z-10 cursor-pointer hover:brightness-95"
+                            style={{ top, height: height - 1, left: `calc(${leftPct}% + 2px)`, width: `calc(${widthPct}% - 4px)`, backgroundColor: colors.bg, borderLeft: `2px solid ${colors.border}`, color: colors.text }}
+                            onClick={(ev) => { ev.stopPropagation(); onEventClick && onEventClick({ ...e, startMinutes: e.startMinutes, endMinutes: e.endMinutes, classification: cls }, ev); }}>
+                            <div className="truncate leading-tight">{e.title}</div>
+                          </div>
+                        );
+                      });
+                    })()}
+                    {/* Current time line */}
+                    {dateStr === todayStr && (() => {
+                      const nowMins = timeToMinutes(new Date().getHours(), new Date().getMinutes());
+                      return <div className="absolute left-0 right-0 z-20 h-px bg-red-500" style={{ top: (nowMins / 60) * HOUR_HEIGHT }} />;
+                    })()}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ===== MONTH VIEW =====
+    function MonthView({ tasks, calendarEvents, selectedDate, settings, toggleDone, onEdit, onDayClick }) {
+      const current = parseLocal(selectedDate);
+      const year = current.getFullYear();
+      const month = current.getMonth();
+
+      // First day of month and its weekday (Mon=0)
+      const firstDay = new Date(year, month, 1);
+      const lastDay = new Date(year, month + 1, 0);
+      const startDow = firstDay.getDay() === 0 ? 6 : firstDay.getDay() - 1; // Mon-based
+
+      // Build 6 weeks grid
+      const gridStart = new Date(firstDay);
+      gridStart.setDate(gridStart.getDate() - startDow);
+
+      const weeks = [];
+      const cursor = new Date(gridStart);
+      for (let w = 0; w < 6; w++) {
+        const week = [];
+        for (let d = 0; d < 7; d++) {
+          week.push(new Date(cursor));
+          cursor.setDate(cursor.getDate() + 1);
+        }
+        weeks.push(week);
+        // Stop if we've passed the month and completed the week
+        if (cursor.getMonth() !== month && weeks.length >= 4) break;
+      }
+
+      const todayStr = new Date().toLocaleDateString('en-CA');
+      const incompleteTasks = tasks.filter(t => t.status !== 'done');
+
+      return (
+        <div className="fade-in bg-white rounded-xl border border-gray-200 overflow-hidden">
+          {/* Weekday headers */}
+          <div className="grid grid-cols-7 border-b border-gray-200">
+            {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map(d => (
+              <div key={d} className="px-2 py-2 text-[10px] font-semibold text-gray-400 uppercase text-center border-r border-gray-100 last:border-r-0">
+                {d}
+              </div>
+            ))}
+          </div>
+          {/* Weeks */}
+          {weeks.map((week, wi) => (
+            <div key={wi} className="grid grid-cols-7 border-b border-gray-100 last:border-b-0">
+              {week.map(d => {
+                const dateStr = d.toLocaleDateString('en-CA');
+                const isToday = dateStr === todayStr;
+                const isCurrentMonth = d.getMonth() === month;
+                const dayEvents = calendarEvents.filter(e => {
+                  const es = new Date(e.start);
+                  return es.toDateString() === d.toDateString();
+                });
+                const dayTasks = incompleteTasks.filter(t => t.deadline && new Date(t.deadline).toDateString() === d.toDateString());
+                const items = [...dayEvents.map(e => ({ type: 'event', title: e.title, id: e.id,
+                  cls: classifyEvent(e.title, settings) })),
+                  ...dayTasks.map(t => ({ type: 'task', title: t.title, id: t.id, task: t }))];
+
+                return (
+                  <div key={dateStr}
+                    className={`min-h-[80px] md:min-h-[100px] px-1 py-1 border-r border-gray-100 last:border-r-0 cursor-pointer hover:bg-gray-50 transition-colors ${!isCurrentMonth ? 'bg-gray-50/50' : ''}`}
+                    onClick={() => onDayClick && onDayClick(dateStr)}>
+                    <div className={`text-xs font-medium mb-1 ${isToday ? 'text-white bg-violet-600 w-6 h-6 rounded-full flex items-center justify-center' : isCurrentMonth ? 'text-gray-700 pl-1' : 'text-gray-300 pl-1'}`}>
+                      {d.getDate()}
+                    </div>
+                    <div className="space-y-0.5">
+                      {items.slice(0, 3).map(item => {
+                        if (item.type === 'event') {
+                          const colors = item.cls === 'soft' ? '#9CA3AF' : item.cls === 'academic' ? '#7C3AED' : '#3B82F6';
+                          return (
+                            <div key={item.id} className="text-[10px] leading-tight truncate rounded px-1 py-0.5 text-white font-medium"
+                              style={{ backgroundColor: colors }}>
+                              {item.title}
+                            </div>
+                          );
+                        }
+                        const cat = CATEGORIES[item.task.category];
+                        return (
+                          <div key={item.id} className="text-[10px] leading-tight truncate rounded px-1 py-0.5 font-medium"
+                            style={{ backgroundColor: cat.light, color: cat.color }}
+                            onClick={(e) => { e.stopPropagation(); onEdit(item.task); }}>
+                            {item.title}
+                          </div>
+                        );
+                      })}
+                      {items.length > 3 && (
+                        <div className="text-[9px] text-gray-400 pl-1">+{items.length - 3} more</div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ===== ALL TASKS VIEW =====
+    function AllTasksView({ tasks, toggleDone, deleteTask, updateTask, onEdit }) {
+      const [filter, setFilter] = useState('all');
+
+      const incomplete = tasks.filter(t => t.status !== 'done');
+      let filtered = incomplete;
+      if (filter !== 'all') filtered = filtered.filter(t => t.category === filter);
+
+      // Build next 7 days starting from today
+      const today = new Date();
+      const todayStr = today.toLocaleDateString('en-CA');
+      const weekDays = Array.from({ length: 7 }, (_, i) => {
+        const d = new Date(today);
+        d.setDate(today.getDate() + i);
+        return d;
+      });
+
+      const shortDayNames = ['Su', 'M', 'Tu', 'W', 'Th', 'F', 'Sa'];
+      const fullDayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      const dayLabels = weekDays.map(d => shortDayNames[d.getDay()]);
+      const dayHeaderLabels = weekDays.map(d => fullDayNames[d.getDay()]);
+
+      // Group tasks by day — past-date tasks auto-unassign
+      const tasksByDay = {};
+      weekDays.forEach(d => { tasksByDay[d.toLocaleDateString('en-CA')] = []; });
+      const unassigned = [];
+
+      filtered.forEach(t => {
+        if (!t.assignedDate) {
+          unassigned.push(t);
+        } else if (tasksByDay[t.assignedDate] !== undefined) {
+          tasksByDay[t.assignedDate].push(t);
+        } else if (t.assignedDate < todayStr) {
+          // Past-date tasks go to unassigned (will auto-clear assignedDate below)
+          unassigned.push(t);
+        } else {
+          // Future tasks beyond the 7-day window
+          unassigned.push(t);
+        }
+      });
+
+      // Quick-assign helper — also clear scheduled time if moving to a different day
+      const assignToDay = (taskId, dateStr) => {
+        const task = tasks.find(t => t.id === taskId);
+        const updates = { assignedDate: dateStr || null };
+        if (task && task.scheduledDate && task.scheduledDate !== dateStr) {
+          updates.scheduledStart = null;
+          updates.scheduledEnd = null;
+          updates.scheduledDate = null;
+        }
+        updateTask(taskId, updates);
+      };
+
+      return (
+        <div className="fade-in space-y-4">
+          {/* Category filter */}
+          <div className="flex bg-white rounded-lg border border-gray-200 p-0.5 w-fit">
+            {['all', ...Object.keys(CATEGORIES)].map(c => (
+              <button key={c} onClick={() => setFilter(c)}
+                className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${filter === c ? 'bg-gray-900 text-white' : 'text-gray-500 hover:text-gray-700'}`}>
+                {c === 'all' ? 'All' : CATEGORIES[c].label}
+              </button>
+            ))}
+          </div>
+
+          {/* Days */}
+          {weekDays.map((d, i) => {
+            const dateStr = d.toLocaleDateString('en-CA');
+            const isToday = dateStr === todayStr;
+            const dayTasks = tasksByDay[dateStr] || [];
+
+            return (
+              <div key={dateStr} className={`rounded-xl border p-4 ${isToday ? 'bg-violet-50 border-violet-200' : 'bg-white border-gray-200'}`}>
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className={`text-sm font-semibold ${isToday ? 'text-violet-700' : 'text-gray-700'}`}>
+                    {dayHeaderLabels[i]} {d.getDate()}{isToday ? ' — Today' : ''}
+                  </h3>
+                  {dayTasks.length > 0 && (
+                    <span className="text-[10px] text-gray-400 font-medium">
+                      {dayTasks.reduce((sum, t) => sum + (t.customMinutes || EFFORT[t.effort].minutes), 0)}m total
+                    </span>
+                  )}
+                </div>
+                {dayTasks.length > 0 ? (
+                  <div className="space-y-2">
+                    {dayTasks.map(t => (
+                      <PlannerTaskCard key={t.id} task={t} weekDays={weekDays} dayLabels={dayLabels} todayStr={todayStr}
+                        toggleDone={toggleDone} deleteTask={deleteTask} onEdit={onEdit} assignToDay={assignToDay} />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-xs text-gray-300 italic">No tasks assigned</div>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Unassigned */}
+          <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50/50 p-4">
+            <h3 className="text-sm font-semibold text-gray-500 mb-2">Unassigned</h3>
+            {unassigned.length > 0 ? (
+              <div className="space-y-2">
+                {unassigned.map(t => (
+                  <PlannerTaskCard key={t.id} task={t} weekDays={weekDays} dayLabels={dayLabels} todayStr={todayStr}
+                    toggleDone={toggleDone} deleteTask={deleteTask} onEdit={onEdit} assignToDay={assignToDay} />
+                ))}
+              </div>
+            ) : (
+              <div className="text-xs text-gray-300 italic">All tasks are assigned to a day</div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ===== PLANNER TASK CARD =====
+    function PlannerTaskCard({ task, weekDays, dayLabels, todayStr, toggleDone, deleteTask, onEdit, assignToDay }) {
+      const cat = CATEGORIES[task.category];
+      const eff = EFFORT[task.effort];
+      const mins = task.customMinutes || eff.minutes;
+      const timeLabel = mins >= 60 ? `${Math.floor(mins / 60)}h${mins % 60 > 0 ? ` ${mins % 60}m` : ''}` : `${mins}m`;
+
+      return (
+        <div className="task-card bg-white rounded-lg border border-gray-200 p-3 flex items-start gap-3">
+          <button onClick={() => toggleDone(task.id)}
+            className="mt-0.5 w-4 h-4 rounded-full border-2 border-gray-300 hover:border-violet-400 flex-shrink-0 transition-colors" />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 mb-1">
+              <div className="category-dot" style={{ backgroundColor: cat.color }} />
+              <span className="text-sm font-medium text-gray-900 truncate cursor-pointer hover:text-violet-600" onClick={() => onEdit(task)}>{task.title}</span>
+              {task.link && (
+                <a href={task.link} target="_blank" rel="noopener noreferrer"
+                  className="text-violet-400 hover:text-violet-600 flex-shrink-0">
+                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M5 1H2a1 1 0 00-1 1v8a1 1 0 001 1h8a1 1 0 001-1V7M7 1h4m0 0v4m0-4L5.5 6.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                </a>
+              )}
+              <span className="text-[10px] text-gray-400 ml-auto flex-shrink-0">{eff.icon} {timeLabel}</span>
+            </div>
+            {/* Quick day assign */}
+            <div className="flex items-center gap-0.5 mt-1">
+              {weekDays.map((d, i) => {
+                const dateStr = d.toLocaleDateString('en-CA');
+                const isAssigned = task.assignedDate === dateStr;
+                return (
+                  <button key={dateStr} onClick={() => assignToDay(task.id, isAssigned ? null : dateStr)}
+                    className={`px-1 h-5 text-[9px] font-semibold rounded transition-colors ${isAssigned ? 'bg-violet-600 text-white' : 'bg-gray-100 text-gray-500 hover:bg-violet-100 hover:text-violet-600'}`}>
+                    {dayLabels[i]}
+                  </button>
+                );
+              })}
+              <button onClick={() => assignToDay(task.id, null)}
+                className={`px-1 h-5 text-[9px] font-medium rounded transition-colors ${!task.assignedDate ? 'bg-gray-300 text-white' : 'bg-gray-100 text-gray-400 hover:bg-gray-200'}`}>
+                None
+              </button>
+            </div>
+          </div>
+          <button onClick={() => deleteTask(task.id)}
+            className="text-gray-200 hover:text-red-400 transition-colors flex-shrink-0 p-0.5 mt-0.5">
+            <svg width="12" height="12" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5"/></svg>
+          </button>
+        </div>
+      );
+    }
+
+    // ===== SETTINGS VIEW =====
+    function SettingsView({ settings, setSettings, gcalConnected, connectGCal, refreshGCal, gcalLoading, user, notify }) {
+      const update = (key, value) => setSettings(prev => ({ ...prev, [key]: value }));
+      const [dataBusy, setDataBusy] = useState(false);
+
+      const exportBackup = async () => {
+        setDataBusy(true);
+        try {
+          const allTasks = await getAllTaskDocuments(user.uid);
+          const data = JSON.stringify({
+            format: 'focus-backup-v2',
+            exportedAt: new Date().toISOString(),
+            tasks: allTasks,
+            settings,
+          }, null, 2);
+          const blob = new Blob([data], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement('a');
+          anchor.href = url;
+          anchor.download = `focus-backup-${new Date().toLocaleDateString('en-CA')}.json`;
+          anchor.click();
+          URL.revokeObjectURL(url);
+          notify('Backup exported');
+        } catch (error) {
+          console.error('Backup export failed', error);
+          notify('Backup export failed', 'error');
+        } finally {
+          setDataBusy(false);
+        }
+      };
+
+      const importBackupFile = async (file) => {
+        if (!file) return;
+        setDataBusy(true);
+        try {
+          const data = JSON.parse(await file.text());
+          if (!Array.isArray(data.tasks)) throw new Error('Backup has no task list');
+          const result = await importLegacyTasks(user.uid, data.tasks);
+          if (data.settings && typeof data.settings === 'object') {
+            const nextSettings = { ...DEFAULT_SETTINGS, ...data.settings };
+            await updateSettingsDocument(user.uid, nextSettings);
+            setSettings(nextSettings);
+          }
+          notify(`Imported ${result.imported} task${result.imported === 1 ? '' : 's'}`);
+        } catch (error) {
+          console.error('Backup import failed', error);
+          notify('That backup file could not be imported', 'error');
+        } finally {
+          setDataBusy(false);
+        }
+      };
+
+      return (
+        <div className="fade-in space-y-6 max-w-2xl">
+          {/* Cloud sync */}
+          <section className="bg-white rounded-xl border border-gray-200 p-5">
+            <h3 className="text-sm font-semibold text-gray-800 mb-2">Cloud Sync</h3>
+            <div className="flex items-center gap-2 text-sm text-emerald-700 font-medium">
+              <span className="w-2 h-2 bg-emerald-500 rounded-full" />
+              Signed in and syncing
+            </div>
+            <p className="mt-2 text-xs text-gray-500">{user.email}</p>
+            <p className="mt-2 text-xs text-gray-400">Tasks are encrypted in transit and protected by your Firebase account and Firestore security rules.</p>
+          </section>
+
+          {/* Google Calendar */}
+          <section className="bg-white rounded-xl border border-gray-200 p-5">
+            <h3 className="text-sm font-semibold text-gray-800 mb-4">Google Calendar</h3>
+            {gcalConnected ? (
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-sm text-emerald-600 font-medium">
+                  <span className="w-2 h-2 bg-emerald-500 rounded-full" /> Connected
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={refreshGCal} disabled={gcalLoading}
+                    className="px-3 py-1.5 text-xs font-medium border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50">
+                    {gcalLoading ? '...' : '↻ Refresh'}
+                  </button>
+                  <button onClick={connectGCal} disabled={gcalLoading}
+                    className="px-3 py-1.5 text-xs font-medium text-violet-600 border border-violet-200 rounded-lg hover:bg-violet-50 disabled:opacity-50">
+                    Reconnect
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Google Client ID</label>
+                  <input type="text" value={settings.googleClientId} onChange={e => update('googleClientId', e.target.value)}
+                    placeholder="your-id.apps.googleusercontent.com"
+                    className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                </div>
+                <button onClick={connectGCal} disabled={!settings.googleClientId || gcalLoading}
+                  className="px-4 py-2 text-sm font-medium bg-violet-600 text-white rounded-lg hover:bg-violet-700 disabled:opacity-50">
+                  {gcalLoading ? 'Connecting...' : 'Connect Google Calendar'}
+                </button>
+                <details className="text-xs text-gray-500">
+                  <summary className="cursor-pointer hover:text-gray-700 font-medium">Setup instructions</summary>
+                  <ol className="mt-2 space-y-1 list-decimal list-inside">
+                    <li>Go to <strong>console.cloud.google.com</strong></li>
+                    <li>Create a new project (or select existing)</li>
+                    <li>Enable the <strong>Google Calendar API</strong></li>
+                    <li>Configure the <strong>OAuth consent screen</strong> (External, add your email as test user)</li>
+                    <li>Go to Credentials → Create <strong>OAuth 2.0 Client ID</strong></li>
+                    <li>Application type: <strong>Web application</strong></li>
+                    <li>Add authorized JavaScript origin: <strong>https://YOUR_USERNAME.github.io</strong></li>
+                    <li>Copy the Client ID and paste above</li>
+                  </ol>
+                  <p className="mt-2 text-gray-400">For local development, also add <strong>http://localhost:5173</strong> as an origin.</p>
+                </details>
+              </div>
+            )}
+          </section>
+
+          {/* Soft Coverage Keywords */}
+          <section className="bg-white rounded-xl border border-gray-200 p-5">
+            <h3 className="text-sm font-semibold text-gray-800 mb-1">Soft Coverage Keywords</h3>
+            <p className="text-xs text-gray-500 mb-3">Events whose name contains any of these keywords are treated as soft blocks — Focus can suggest quick tasks during them.</p>
+            <div className="space-y-2">
+              {(settings.softKeywords || []).map((kw, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <input type="text" value={kw} onChange={e => {
+                    const updated = [...(settings.softKeywords || [])];
+                    updated[i] = e.target.value;
+                    update('softKeywords', updated);
+                  }} placeholder="e.g. contrast coverage"
+                    className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                  <button type="button" onClick={() => {
+                    update('softKeywords', (settings.softKeywords || []).filter((_, j) => j !== i));
+                  }} className="text-gray-300 hover:text-red-400 p-1">
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5"/></svg>
+                  </button>
+                </div>
+              ))}
+              <button type="button" onClick={() => update('softKeywords', [...(settings.softKeywords || []), ''])}
+                className="text-xs text-violet-600 hover:text-violet-700 font-medium">+ Add keyword</button>
+            </div>
+          </section>
+
+          {/* Hidden Events */}
+          <section className="bg-white rounded-xl border border-gray-200 p-5">
+            <h3 className="text-sm font-semibold text-gray-800 mb-1">Hidden Events</h3>
+            <p className="text-xs text-gray-500 mb-3">Events matching these keywords or starting with these prefixes won't appear in Focus.</p>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-1">Contains keyword</label>
+                <div className="space-y-1">
+                  {(settings.hiddenEventKeywords || []).map((kw, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <input type="text" value={kw} onChange={e => {
+                        const updated = [...(settings.hiddenEventKeywords || [])];
+                        updated[i] = e.target.value;
+                        update('hiddenEventKeywords', updated);
+                      }} className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                      <button type="button" onClick={() => update('hiddenEventKeywords', (settings.hiddenEventKeywords || []).filter((_, j) => j !== i))}
+                        className="text-gray-300 hover:text-red-400 p-1">
+                        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5"/></svg>
+                      </button>
+                    </div>
+                  ))}
+                  <button type="button" onClick={() => update('hiddenEventKeywords', [...(settings.hiddenEventKeywords || []), ''])}
+                    className="text-xs text-violet-600 hover:text-violet-700 font-medium">+ Add keyword</button>
+                </div>
+              </div>
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-1">Starts with</label>
+                <div className="space-y-1">
+                  {(settings.hiddenEventPrefixes || []).map((prefix, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <input type="text" value={prefix} onChange={e => {
+                        const updated = [...(settings.hiddenEventPrefixes || [])];
+                        updated[i] = e.target.value;
+                        update('hiddenEventPrefixes', updated);
+                      }} className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                      <button type="button" onClick={() => update('hiddenEventPrefixes', (settings.hiddenEventPrefixes || []).filter((_, j) => j !== i))}
+                        className="text-gray-300 hover:text-red-400 p-1">
+                        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5"/></svg>
+                      </button>
+                    </div>
+                  ))}
+                  <button type="button" onClick={() => update('hiddenEventPrefixes', [...(settings.hiddenEventPrefixes || []), ''])}
+                    className="text-xs text-violet-600 hover:text-violet-700 font-medium">+ Add prefix</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* Event Rename Rules */}
+          <section className="bg-white rounded-xl border border-gray-200 p-5">
+            <h3 className="text-sm font-semibold text-gray-800 mb-1">Event Rename Rules</h3>
+            <p className="text-xs text-gray-500 mb-3">Rename events that match a keyword.</p>
+            <div className="space-y-2">
+              {(settings.eventRenameRules || []).map((rule, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <input type="text" value={rule.match} onChange={e => {
+                    const updated = [...(settings.eventRenameRules || [])];
+                    updated[i] = { ...updated[i], match: e.target.value };
+                    update('eventRenameRules', updated);
+                  }} placeholder="Contains..." className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                  <span className="text-xs text-gray-400">→</span>
+                  <input type="text" value={rule.replace} onChange={e => {
+                    const updated = [...(settings.eventRenameRules || [])];
+                    updated[i] = { ...updated[i], replace: e.target.value };
+                    update('eventRenameRules', updated);
+                  }} placeholder="Rename to..." className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                  <button type="button" onClick={() => update('eventRenameRules', (settings.eventRenameRules || []).filter((_, j) => j !== i))}
+                    className="text-gray-300 hover:text-red-400 p-1">
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5"/></svg>
+                  </button>
+                </div>
+              ))}
+              <button type="button" onClick={() => update('eventRenameRules', [...(settings.eventRenameRules || []), { match: '', replace: '' }])}
+                className="text-xs text-violet-600 hover:text-violet-700 font-medium">+ Add rule</button>
+            </div>
+          </section>
+
+          {/* Schedule Preferences */}
+          <section className="bg-white rounded-xl border border-gray-200 p-5">
+            <h3 className="text-sm font-semibold text-gray-800 mb-4">Schedule Preferences</h3>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">Weekday available after</label>
+                <select value={settings.weekdayAvailableAfter} onChange={e => update('weekdayAvailableAfter', Number(e.target.value))}
+                  className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg">
+                  {Array.from({ length: 12 }, (_, i) => i + 12).map(h => (
+                    <option key={h} value={h}>{fmt.timeShort(h)}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">Weekday available until</label>
+                <select value={settings.weekdayAvailableUntil} onChange={e => update('weekdayAvailableUntil', Number(e.target.value))}
+                  className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg">
+                  {Array.from({ length: 8 }, (_, i) => i + 17).map(h => (
+                    <option key={h} value={h}>{fmt.timeShort(h)}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">Weekend available after</label>
+                <select value={settings.weekendAvailableAfter} onChange={e => update('weekendAvailableAfter', Number(e.target.value))}
+                  className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg">
+                  {Array.from({ length: 10 }, (_, i) => i + 7).map(h => (
+                    <option key={h} value={h}>{fmt.timeShort(h)}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">Weekend available until</label>
+                <select value={settings.weekendAvailableUntil} onChange={e => update('weekendAvailableUntil', Number(e.target.value))}
+                  className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg">
+                  {Array.from({ length: 8 }, (_, i) => i + 17).map(h => (
+                    <option key={h} value={h}>{fmt.timeShort(h)}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-span-2">
+                <label className="block text-xs font-medium text-gray-600 mb-1">Deadline danger zone (hours)</label>
+                <input type="number" value={settings.dangerZoneHours} onChange={e => update('dangerZoneHours', Number(e.target.value))}
+                  className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg" min="1" max="168" />
+                <p className="text-xs text-gray-400 mt-1">Tasks due within this window get top priority</p>
+              </div>
+              <div className="col-span-2">
+                <label className="block text-xs font-medium text-gray-600 mb-1">Auto-refresh calendar every</label>
+                <div className="flex items-center gap-2">
+                  <input type="number" value={settings.calendarRefreshMinutes || 30} onChange={e => update('calendarRefreshMinutes', Number(e.target.value))}
+                    className="w-24 px-3 py-2 text-sm border border-gray-200 rounded-lg" min="5" max="120" />
+                  <span className="text-xs text-gray-400">minutes</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* Data */}
+          <section className="bg-white rounded-xl border border-gray-200 p-5">
+            <h3 className="text-sm font-semibold text-gray-800 mb-4">Data</h3>
+            <p className="mb-3 text-xs text-gray-500">Exports include active and completed cloud tasks. Imports merge newer task versions and leave existing cloud data intact.</p>
+            <div className="flex flex-wrap gap-2">
+              <button onClick={exportBackup} disabled={dataBusy}
+                className="min-h-11 px-3 py-1.5 text-sm font-medium border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-60">
+                {dataBusy ? 'Working…' : 'Export backup'}
+              </button>
+              <label className={`min-h-11 px-3 py-1.5 text-sm font-medium border border-gray-200 rounded-lg hover:bg-gray-50 cursor-pointer flex items-center ${dataBusy ? 'opacity-60 pointer-events-none' : ''}`}>
+                Import backup
+                <input type="file" accept="application/json,.json" className="hidden" disabled={dataBusy}
+                  onChange={(event) => importBackupFile(event.target.files?.[0])} />
+              </label>
+            </div>
+          </section>
+        </div>
+      );
+    }
+
+    // ===== SLOT PICKER =====
+    function SlotPicker({ slot, tasks, onAssignExisting, onCreateNew, onClose }) {
+      const [mode, setMode] = useState(null); // null | 'existing'
+      const [search, setSearch] = useState('');
+      const incomplete = tasks.filter(t => t.status !== 'done' && !(t.scheduledStart != null && t.scheduledDate));
+      const filtered = search ? incomplete.filter(t => t.title.toLowerCase().includes(search.toLowerCase())) : incomplete;
+      const duration = slot.endMinutes - slot.startMinutes;
+
+      return (
+        <div className="fixed inset-0 bg-black/40 modal-overlay flex items-center justify-center z-50 p-4" onClick={onClose}>
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm fade-in overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-5 pt-5 pb-3 border-b border-gray-100">
+              <h3 className="text-base font-semibold text-gray-900">
+                {fmt.timeShort(Math.floor(slot.startMinutes / 60), slot.startMinutes % 60)} – {fmt.timeShort(Math.floor(slot.endMinutes / 60), slot.endMinutes % 60)}
+                <span className="text-sm font-normal text-gray-400 ml-2">{duration}m</span>
+              </h3>
+            </div>
+            <div className="px-5 py-4">
+              {!mode ? (
+                <div className="space-y-2">
+                  <button onClick={() => setMode('existing')}
+                    className="w-full p-3 text-left border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
+                    <div className="font-medium text-sm text-gray-900">Assign existing task</div>
+                    <div className="text-xs text-gray-500 mt-0.5">{incomplete.length} available tasks</div>
+                  </button>
+                  <button onClick={() => onCreateNew(slot.startMinutes, slot.endMinutes)}
+                    className="w-full p-3 text-left border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
+                    <div className="font-medium text-sm text-gray-900">Create new task</div>
+                    <div className="text-xs text-gray-500 mt-0.5">Pre-filled with this time slot</div>
+                  </button>
+                </div>
+              ) : (
+                <div>
+                  <input type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search tasks..."
+                    autoFocus className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 mb-3" />
+                  <div className="space-y-1.5 max-h-64 overflow-y-auto">
+                    {filtered.length === 0 && <p className="text-xs text-gray-400 text-center py-4">No matching tasks</p>}
+                    {filtered.map(t => {
+                      const cat = CATEGORIES[t.category];
+                      return (
+                        <button key={t.id} onClick={() => onAssignExisting(t.id, slot.startMinutes, slot.endMinutes)}
+                          className="w-full text-left p-2.5 rounded-lg border border-gray-200 hover:border-violet-300 hover:bg-violet-50 transition-colors">
+                          <div className="flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: cat.color }} />
+                            <span className="text-sm font-medium text-gray-900 truncate">{t.title}</span>
+                          </div>
+                          <div className="text-xs text-gray-400 ml-4 mt-0.5">{cat.label} · {t.customMinutes || EFFORT[t.effort].minutes}m</div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="px-5 py-3 bg-gray-50 border-t border-gray-100 flex justify-between">
+              {mode && <button type="button" onClick={() => setMode(null)} className="px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100 rounded-lg">Back</button>}
+              <button type="button" onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100 rounded-lg ml-auto">Cancel</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ===== TASK MODAL =====
+    function TaskModal({ task, onSave, onClose, onRemoveFromSchedule, slotInfo }) {
+      const [title, setTitle] = useState(task?.title || '');
+      const [notes, setNotes] = useState(task?.notes || '');
+      const [category, setCategory] = useState(task?.category || 'research');
+      const [effort, setEffort] = useState(task?.effort || 'medium');
+      const [customMinutes, setCustomMinutes] = useState(() => {
+        if (task?.customMinutes) return task.customMinutes;
+        if (slotInfo) return slotInfo.slotDuration || (slotInfo.slotEnd - slotInfo.slotStart);
+        return '';
+      });
+      const [importance, setImportance] = useState(task?.importance || 2);
+      const [hasDeadline, setHasDeadline] = useState(!!task?.deadline);
+      const [deadline, setDeadline] = useState(task?.deadline ? formatDateTimeLocal(task.deadline) : '');
+      const [formError, setFormError] = useState('');
+      const [assignedDate, setAssignedDate] = useState(() => {
+        if (task?.assignedDate) return task.assignedDate;
+        if (slotInfo?.slotDate) return slotInfo.slotDate;
+        return '';
+      });
+      const [link, setLink] = useState(task?.link || '');
+      // Scheduled time fields
+      const [hasScheduledTime, setHasScheduledTime] = useState(!!(task?.scheduledStart != null || slotInfo));
+      const [schedStartH, setSchedStartH] = useState(() => {
+        if (task?.scheduledStart != null) return Math.floor(task.scheduledStart / 60);
+        if (slotInfo) return Math.floor(slotInfo.slotStart / 60);
+        return 9;
+      });
+      const [schedStartM, setSchedStartM] = useState(() => {
+        if (task?.scheduledStart != null) return task.scheduledStart % 60;
+        if (slotInfo) return slotInfo.slotStart % 60;
+        return 0;
+      });
+      const [schedEndH, setSchedEndH] = useState(() => {
+        if (task?.scheduledEnd != null) return Math.floor(task.scheduledEnd / 60);
+        if (slotInfo) return Math.floor(slotInfo.slotEnd / 60);
+        return 10;
+      });
+      const [schedEndM, setSchedEndM] = useState(() => {
+        if (task?.scheduledEnd != null) return task.scheduledEnd % 60;
+        if (slotInfo) return slotInfo.slotEnd % 60;
+        return 0;
+      });
+      const [schedDate, setSchedDate] = useState(() => {
+        if (task?.scheduledDate) return task.scheduledDate;
+        if (slotInfo?.slotDate) return slotInfo.slotDate;
+        return '';
+      });
+
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        if (!title.trim()) return;
+        const schedStart = hasScheduledTime ? schedStartH * 60 + schedStartM : null;
+        const schedEnd = hasScheduledTime ? schedEndH * 60 + schedEndM : null;
+        if (hasScheduledTime && schedEnd <= schedStart) {
+          setFormError('The end time must be later than the start time.');
+          return;
+        }
+        setFormError('');
+        onSave({
+          title: title.trim(), notes, category, effort, importance,
+          customMinutes: customMinutes ? Number(customMinutes) : null,
+          deadline: hasDeadline && deadline ? new Date(deadline).toISOString() : null,
+          assignedDate: assignedDate || schedDate || null,
+          link: link.trim() || null,
+          scheduledStart: schedStart,
+          scheduledEnd: schedEnd,
+          scheduledDate: hasScheduledTime ? (schedDate || assignedDate || null) : null,
+        });
+      };
+
+      // Effective minutes for display
+      const effectiveMins = customMinutes ? Number(customMinutes) : EFFORT[effort].minutes;
+
+      return (
+        <div className="fixed inset-0 bg-black/40 modal-overlay flex items-center justify-center z-50 p-4" onClick={onClose}>
+          <form onSubmit={handleSubmit} onClick={e => e.stopPropagation()}
+            className="bg-white rounded-2xl shadow-xl w-full max-w-md fade-in overflow-hidden max-h-[90vh] flex flex-col">
+            <div className="px-5 pt-5 pb-3 overflow-y-auto flex-1">
+              <h3 className="text-base font-semibold text-gray-900 mb-4">{task ? 'Edit Task' : 'New Task'}</h3>
+
+              <input type="text" value={title} onChange={e => setTitle(e.target.value)} placeholder="What do you need to do?"
+                autoFocus className="w-full text-lg font-medium text-gray-900 placeholder-gray-300 outline-none mb-4 border-b border-gray-100 pb-2" />
+
+              {/* Category */}
+              <div className="mb-4">
+                <label className="block text-xs font-medium text-gray-500 mb-2">Category</label>
+                <div className="flex gap-2">
+                  {Object.entries(CATEGORIES).map(([key, cat]) => (
+                    <button key={key} type="button" onClick={() => setCategory(key)}
+                      className={`min-h-10 flex-1 px-2 py-1.5 text-xs font-medium rounded-lg border-2 transition-colors ${category === key ? 'border-current' : 'border-transparent bg-gray-50'}`}
+                      style={category === key ? { backgroundColor: cat.light, color: cat.color, borderColor: cat.color } : {}}>
+                      {cat.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Time estimate */}
+              <div className="mb-4">
+                <label className="block text-xs font-medium text-gray-500 mb-2">How long will this take?</label>
+                <div className="flex gap-2 mb-2">
+                  {Object.entries(EFFORT).map(([key, e]) => (
+                    <button key={key} type="button" onClick={() => { setEffort(key); setCustomMinutes(''); }}
+                      className={`min-h-10 flex-1 px-2 py-1.5 text-xs font-medium rounded-lg transition-colors ${effort === key && !customMinutes ? 'bg-gray-900 text-white' : 'bg-gray-50 text-gray-600 hover:bg-gray-100'}`}>
+                      {e.icon} {e.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex items-center gap-2">
+                  <input type="number" value={customMinutes} onChange={e => setCustomMinutes(e.target.value)}
+                    placeholder={`${EFFORT[effort].minutes}`} min="5" max="480"
+                    className="w-24 px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                  <span className="text-xs text-gray-400">minutes</span>
+                  <span className="text-xs text-gray-300 ml-auto">
+                    {effectiveMins >= 60 ? `${Math.floor(effectiveMins / 60)}h ${effectiveMins % 60 > 0 ? effectiveMins % 60 + 'm' : ''}` : `${effectiveMins}m`}
+                  </span>
+                </div>
+              </div>
+
+              {/* Priority */}
+              <div className="mb-4">
+                <label className="block text-xs font-medium text-gray-500 mb-2">Priority</label>
+                <div className="flex gap-2">
+                  {[{ v: 1, label: 'Low', color: 'bg-gray-100 text-gray-600' }, { v: 2, label: 'Medium', color: 'bg-amber-50 text-amber-700' }, { v: 3, label: 'High', color: 'bg-red-50 text-red-600' }].map(p => (
+                    <button key={p.v} type="button" onClick={() => setImportance(p.v)}
+                      className={`min-h-10 flex-1 px-2 py-1.5 text-xs font-medium rounded-lg transition-colors border-2 ${importance === p.v ? `${p.color} border-current` : 'bg-gray-50 text-gray-400 border-transparent'}`}>
+                      {'★'.repeat(p.v)} {p.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Assigned Day */}
+              <div className="mb-4">
+                <label className="block text-xs font-medium text-gray-500 mb-2">Assigned day</label>
+                <div className="flex flex-wrap items-center gap-1">
+                  {(() => {
+                    const today = new Date();
+                    const shortNames = ['Su', 'M', 'Tu', 'W', 'Th', 'F', 'Sa'];
+                    const days = Array.from({ length: 7 }, (_, i) => {
+                      const d = new Date(today);
+                      d.setDate(today.getDate() + i);
+                      return d;
+                    });
+                    return days.map((d, i) => {
+                      const dateStr = d.toLocaleDateString('en-CA');
+                      const isSelected = assignedDate === dateStr;
+                      return (
+                        <button key={dateStr} type="button" onClick={() => { const newDate = isSelected ? '' : dateStr; setAssignedDate(newDate); if (hasScheduledTime && newDate && schedDate !== newDate) { setSchedDate(newDate); } if (!newDate) { setHasScheduledTime(false); } }}
+                          className={`w-10 h-10 text-xs font-semibold rounded-lg transition-colors ${isSelected ? 'bg-violet-600 text-white' : 'bg-gray-50 text-gray-600 hover:bg-gray-100'}`}>
+                          <div className="text-[10px] leading-tight">{shortNames[d.getDay()]}</div>
+                          <div className="text-[10px] leading-tight">{d.getDate()}</div>
+                        </button>
+                      );
+                    });
+                  })()}
+                  <button type="button" onClick={() => setAssignedDate('')}
+                    className={`ml-1 px-2 min-h-10 text-[10px] font-medium rounded-lg transition-colors ${!assignedDate ? 'bg-gray-200 text-gray-700' : 'bg-gray-50 text-gray-400 hover:bg-gray-100'}`}>
+                    None
+                  </button>
+                </div>
+              </div>
+
+              {/* Deadline */}
+              <div className="mb-4">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={hasDeadline} onChange={e => setHasDeadline(e.target.checked)}
+                    className="rounded border-gray-300 text-violet-600 focus:ring-violet-500" />
+                  <span className="text-xs font-medium text-gray-500">Has a deadline</span>
+                </label>
+                {hasDeadline && (
+                  <input type="datetime-local" value={deadline} onChange={e => setDeadline(e.target.value)}
+                    className="mt-2 w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500" />
+                )}
+              </div>
+
+              {/* Link */}
+              <div className="mb-3">
+                <label className="block text-xs font-medium text-gray-500 mb-1">Link (optional)</label>
+                <input type="url" value={link} onChange={e => setLink(e.target.value)} placeholder="https://..."
+                  className="w-full px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 text-gray-600 placeholder-gray-300" />
+              </div>
+
+              {/* Scheduled Time */}
+              <div className="mb-4">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={hasScheduledTime} onChange={e => setHasScheduledTime(e.target.checked)}
+                    className="rounded border-gray-300 text-violet-600 focus:ring-violet-500" />
+                  <span className="text-xs font-medium text-gray-500">Schedule at a specific time</span>
+                </label>
+                {hasScheduledTime && (
+                  <div className="mt-2 flex items-center gap-2 flex-wrap">
+                    <div className="flex items-center gap-1">
+                      <select value={schedStartH} onChange={e => setSchedStartH(Number(e.target.value))}
+                        className="px-2 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500">
+                        {Array.from({ length: 24 }, (_, i) => <option key={i} value={i}>{i === 0 ? '12' : i > 12 ? i - 12 : i}</option>)}
+                      </select>
+                      <span className="text-gray-400">:</span>
+                      <select value={schedStartM} onChange={e => setSchedStartM(Number(e.target.value))}
+                        className="px-2 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500">
+                        {[0, 15, 30, 45].map(m => <option key={m} value={m}>{String(m).padStart(2, '0')}</option>)}
+                      </select>
+                      <span className="text-xs text-gray-400">{schedStartH < 12 ? 'AM' : 'PM'}</span>
+                    </div>
+                    <span className="text-gray-400 text-sm">to</span>
+                    <div className="flex items-center gap-1">
+                      <select value={schedEndH} onChange={e => setSchedEndH(Number(e.target.value))}
+                        className="px-2 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500">
+                        {Array.from({ length: 24 }, (_, i) => <option key={i} value={i}>{i === 0 ? '12' : i > 12 ? i - 12 : i}</option>)}
+                      </select>
+                      <span className="text-gray-400">:</span>
+                      <select value={schedEndM} onChange={e => setSchedEndM(Number(e.target.value))}
+                        className="px-2 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500">
+                        {[0, 15, 30, 45].map(m => <option key={m} value={m}>{String(m).padStart(2, '0')}</option>)}
+                      </select>
+                      <span className="text-xs text-gray-400">{schedEndH < 12 ? 'AM' : 'PM'}</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Notes */}
+              <div className="mb-2">
+                <label className="block text-xs font-medium text-gray-500 mb-1">Notes (optional)</label>
+                <textarea value={notes} onChange={e => setNotes(e.target.value)} placeholder="Any extra context..."
+                  rows={2} className="w-full text-sm text-gray-600 placeholder-gray-300 outline-none resize-none bg-gray-50 rounded-lg p-2 border border-gray-200 focus:ring-2 focus:ring-violet-500 focus:outline-none" />
+              </div>
+              {formError && <p className="mb-2 text-sm text-red-600" role="alert">{formError}</p>}
+            </div>
+
+            <div className="px-5 py-3 bg-gray-50 flex items-center border-t border-gray-100 flex-shrink-0">
+              {onRemoveFromSchedule && task && (
+                <button type="button" onClick={() => { onRemoveFromSchedule(task.id); onClose(); }}
+                  className="px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 rounded-lg mr-auto">
+                  Remove from Schedule
+                </button>
+              )}
+              {!onRemoveFromSchedule && task && task.scheduledStart != null && (
+                <button type="button" onClick={() => { onSave({ title: task.title, notes: task.notes, category: task.category, effort: task.effort, importance: task.importance, customMinutes: task.customMinutes, deadline: task.deadline, assignedDate: task.assignedDate, link: task.link, scheduledStart: null, scheduledEnd: null, scheduledDate: null }); }}
+                  className="px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 rounded-lg mr-auto">
+                  Clear Time
+                </button>
+              )}
+              <div className="flex gap-2 ml-auto">
+                <button type="button" onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-100 rounded-lg">Cancel</button>
+                <button type="submit" className="px-4 py-2 text-sm font-medium bg-violet-600 text-white rounded-lg hover:bg-violet-700">
+                  {task ? 'Save' : 'Add Task'}
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      );
+    }
+
+    // ===== TASK CARD =====
+    function TaskCard({ task, toggleDone, deleteTask, onEdit }) {
+      const cat = CATEGORIES[task.category];
+      const eff = EFFORT[task.effort];
+      const isDone = task.status === 'done';
+      const mins = task.customMinutes || eff.minutes;
+      const timeLabel = mins >= 60 ? `${Math.floor(mins / 60)}h${mins % 60 > 0 ? ` ${mins % 60}m` : ''}` : `${mins}m`;
+
+      return (
+        <div className={`task-card bg-white rounded-xl border border-gray-200 p-4 flex items-start gap-3 ${isDone ? 'opacity-60' : ''}`}>
+          <button onClick={() => toggleDone(task.id)}
+            className={`mt-0.5 w-5 h-5 rounded-full border-2 flex-shrink-0 flex items-center justify-center transition-colors ${isDone ? 'bg-violet-500 border-violet-500 text-white' : 'border-gray-300 hover:border-violet-400'}`}>
+            {isDone && <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 5l2 2 4-4" stroke="currentColor" strokeWidth="2" fill="none"/></svg>}
+          </button>
+          <div className="flex-1 min-w-0 cursor-pointer" onClick={() => onEdit(task)}>
+            <div className="flex items-center gap-2 mb-1">
+              <div className="category-dot" style={{ backgroundColor: cat.color }} />
+              <span className={`text-sm font-medium ${isDone ? 'line-through text-gray-400' : 'text-gray-900'}`}>{task.title}</span>
+              {task.link && (
+                <a href={task.link} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()}
+                  className="text-violet-400 hover:text-violet-600 flex-shrink-0">
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M5 1H2a1 1 0 00-1 1v8a1 1 0 001 1h8a1 1 0 001-1V7M7 1h4m0 0v4m0-4L5.5 6.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                </a>
+              )}
+            </div>
+            <div className="flex items-center gap-2 text-xs text-gray-400 flex-wrap">
+              <span style={{ color: cat.color }}>{cat.label}</span>
+              <span>·</span>
+              <span>{eff.icon} {timeLabel}</span>
+              {task.deadline && (
+                <>
+                  <span>·</span>
+                  <span className={new Date(task.deadline) < new Date() && !isDone ? 'text-red-500 font-medium' : ''}>
+                    {fmt.relative(task.deadline)}
+                  </span>
+                </>
+              )}
+              <span>·</span>
+              <span className="text-amber-400">{'★'.repeat(task.importance)}{'☆'.repeat(3 - task.importance)}</span>
+            </div>
+            {task.notes && <p className="text-xs text-gray-400 mt-1 truncate">{task.notes}</p>}
+          </div>
+          <button onClick={() => deleteTask(task.id)}
+            className="text-gray-300 hover:text-red-400 transition-colors flex-shrink-0 p-1">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5"/></svg>
+          </button>
+        </div>
+      );
+    }
+
+    // ===== MINI TASK CARD =====
+    function MiniTaskCard({ task, toggleDone, onEdit }) {
+      const cat = CATEGORIES[task.category];
+      const eff = EFFORT[task.effort];
+      const mins = task.customMinutes || eff.minutes;
+
+      return (
+        <div className="flex items-center gap-2 group">
+          <button onClick={() => toggleDone(task.id)}
+            className="w-4 h-4 rounded-full border-2 border-gray-300 hover:border-violet-400 flex-shrink-0 transition-colors" />
+          <div className="category-dot" style={{ backgroundColor: cat.color }} />
+          <span className="text-sm text-gray-800 truncate flex-1 cursor-pointer hover:text-violet-600" onClick={() => onEdit(task)}>
+            {task.title}
+          </span>
+          <span className="text-[11px] text-gray-400">{eff.icon} {mins}m</span>
+          {task.deadline && <span className="text-[11px] text-gray-400">{fmt.relative(task.deadline)}</span>}
+        </div>
+      );
+    }
+
+export default function Root() {
+  return <AuthGate><App /></AuthGate>;
+}
