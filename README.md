@@ -78,3 +78,39 @@ Calendar access is optional and separate from Firebase login. Enter the Google O
 The browser Calendar token is intentionally not stored as a long-lived credential. After a reload or a new browser session, use the **Reconnect Calendar** notice in the Calendar view to load events again. Task sync remains connected through Firebase independently.
 
 Pushing a scheduled Focus task stores a private `focusTaskId` property on its calendar event. Later pushes update that event instead of creating another copy.
+
+## Muse bridge API
+
+`bridge/api/focus.js` is a private HTTPS endpoint (Vercel serverless function,
+free tier) so Muse can read and manage Focus tasks. It uses the Firebase Admin
+SDK (which bypasses the client-side security rules) and is guarded by a shared
+secret sent in the `x-focus-key` header.
+
+### One-time setup
+
+1. Push this repo to GitHub (the bridge deploys from the `bridge/` folder).
+2. In the Firebase console, go to **Project settings → Service accounts →
+   Generate new private key**. Save the downloaded JSON — it is a master key
+   for your database, so never commit it or share it.
+3. In Vercel, import the repo as a new project with **Root Directory** set to
+   `bridge`.
+4. In the Vercel project settings, add these environment variables:
+   - `FIREBASE_SERVICE_ACCOUNT` — the entire contents of the JSON key file
+   - `FOCUS_API_KEY` — the shared secret (generate one with `openssl rand -hex 32`)
+5. Deploy.
+
+The endpoint will be live at:
+`https://<your-project>.vercel.app/api/focus`
+
+### Actions
+
+- `GET ?action=list` — active tasks (add `includeDone=1` for everything)
+- `GET ?action=get&id=<taskId>` — single task
+- `POST {action:"create", title, notes?, category?, effort?, importance?, deadline?, link?, assignedDate?, scheduledStart?, scheduledEnd?, scheduledDate?, customMinutes?}`
+- `POST {action:"update", id, ...fields}`
+- `POST {action:"complete", id}` / `POST {action:"reopen", id}`
+- `POST {action:"delete", id}` — soft delete (keeps the deletion marker)
+
+Field semantics match `src/lib/tasks.js`: importance is clamped 1–3, every
+mutation bumps `updatedAt`, and deletes are soft so offline devices can't
+resurrect tasks.

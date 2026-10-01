@@ -1,7 +1,6 @@
 node_modules/
-.pnpm-store/
-dist/
 .firebase/
+.vercel
 .env
-.env.local
+*.log
 .DS_Store
