@@ -59,6 +59,14 @@ The expected public URL is `https://sid-dogra.github.io/focus/`.
 
 The migration keeps the old browser copy. It imports a task only when its ID is missing from Firestore or the local copy is newer, so rerunning it is safe.
 
+## If a device stops syncing
+
+The sync badge turns green only after both task and settings listeners receive server-confirmed data and queued edits are acknowledged. Cached tasks alone do not mean a device is synced.
+
+Tap the sync badge or **Reconnect** to check Firestore directly, even if the browser says it is offline. Checks time out after 15 seconds instead of leaving the button stuck. Focus also rechecks when the app comes back into view and retries a failed connection once a minute while visible.
+
+If the connection remains unavailable while other sites work, try another network or check whether a VPN or content blocker is blocking Firebase. Access-denied and usage-limit errors appear separately. Keep the app's storage intact while edits are waiting to sync; reinstalling or clearing site data can remove those local edits.
+
 ## Data model
 
 ```text

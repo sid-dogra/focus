@@ -2,7 +2,9 @@ import {
   collection,
   doc,
   enableNetwork,
+  getDocFromServer,
   getDocsFromServer,
+  limit,
   onSnapshot,
   query,
   serverTimestamp,
@@ -17,6 +19,7 @@ import {
   selectLegacyTasksToImport,
   taskForFirestore,
 } from './tasks';
+import { withSyncTimeout } from './sync';
 
 const tasksCollection = (userId) => collection(db, 'users', userId, 'tasks');
 const taskDocument = (userId, taskId) => doc(db, 'users', userId, 'tasks', taskId);
@@ -86,9 +89,24 @@ export function updateSettingsDocument(userId, settings) {
   }, { merge: true });
 }
 
-export async function retryCloudSync() {
-  await enableNetwork(db);
-  await waitForPendingWrites(db);
+let pendingWritesCheck;
+
+export function retryCloudSync(userId) {
+  return withSyncTimeout(async () => {
+    await enableNetwork(db);
+    // Reuse an outstanding wait across retries; timeouts do not discard queued writes.
+    if (!pendingWritesCheck) {
+      const pending = waitForPendingWrites(db);
+      pendingWritesCheck = pending;
+      const reset = () => { if (pendingWritesCheck === pending) pendingWritesCheck = null; };
+      pending.then(reset, reset);
+    }
+    await Promise.all([
+      getDocsFromServer(query(tasksCollection(userId), where('active', '==', true), limit(1))),
+      getDocFromServer(settingsDocument(userId)),
+      pendingWritesCheck,
+    ]);
+  });
 }
 
 export async function importLegacyTasks(userId, legacyTasks) {

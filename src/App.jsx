@@ -9,13 +9,13 @@ import {
   deleteTaskDocument,
   getAllTaskDocuments,
   importLegacyTasks,
-  retryCloudSync,
   subscribeToSettings,
   subscribeToTasks,
   updateSettingsDocument,
   updateTaskDocument,
 } from './lib/firestore';
 import { formatDateTimeLocal, normalizeTask } from './lib/tasks';
+import useCloudSync from './lib/useCloudSync';
 import CalendarConnectionNotice from './components/CalendarConnectionNotice';
 
     // ===== CONSTANTS =====
@@ -602,13 +602,13 @@ import CalendarConnectionNotice from './components/CalendarConnectionNotice';
       const [eventPopover, setEventPopover] = useState(null); // { event, x, y }
       const [dragState, setDragState] = useState(null); // { startMinutes, currentMinutes }
       const [showSlotPicker, setShowSlotPicker] = useState(null); // { startMinutes, endMinutes }
-      const [syncStatus, setSyncStatus] = useState('connecting'); // connecting | pending | synced | offline | error
       const [lastSyncTime, setLastSyncTime] = useState(() => storage.get('lastSyncTime', 0));
       const [tasksReady, setTasksReady] = useState(false);
       const [settingsReady, setSettingsReady] = useState(false);
       const [taskSyncMeta, setTaskSyncMeta] = useState({ fromCache: true, hasPendingWrites: false });
       const [settingsSyncMeta, setSettingsSyncMeta] = useState({ fromCache: true, hasPendingWrites: false });
-      const [online, setOnline] = useState(() => navigator.onLine);
+      const [settingsPending, setSettingsPending] = useState(false);
+      const [pendingTaskWrites, setPendingTaskWrites] = useState(0);
       const [migrationComplete, setMigrationComplete] = useState(() => storage.get('firestore_migrated_v1', false));
       const [migrationLoading, setMigrationLoading] = useState(false);
       const settingsSaveTimer = useRef(null);
@@ -620,12 +620,22 @@ import CalendarConnectionNotice from './components/CalendarConnectionNotice';
         window.setTimeout(() => setNotification(null), 3000);
       }, []);
 
+      const {
+        status: syncStatus, online, checking: syncChecking, listenerVersion,
+        reportError: reportSyncError, errorMessage: syncErrorMessage, retry: retrySync,
+      } = useCloudSync({
+        userId: user.uid, tasksReady, settingsReady,
+        taskMeta: taskSyncMeta, settingsMeta: settingsSyncMeta,
+        localPending: settingsPending || pendingTaskWrites > 0,
+      });
+
       // Firestore listeners are the source of truth. They emit local writes immediately,
       // then emit again when the server acknowledges them.
       useEffect(() => {
         setTasksReady(false);
         setSettingsReady(false);
-        setSyncStatus(navigator.onLine ? 'connecting' : 'offline');
+        setTaskSyncMeta({ fromCache: true, hasPendingWrites: false });
+        setSettingsSyncMeta({ fromCache: true, hasPendingWrites: false });
 
         const stopTasks = subscribeToTasks(user.uid, (nextTasks, metadata) => {
           setTasks(nextTasks);
@@ -633,8 +643,7 @@ import CalendarConnectionNotice from './components/CalendarConnectionNotice';
           setTasksReady(true);
         }, (error) => {
           console.error('Task sync failed', error);
-          setSyncStatus('error');
-          notify('Task sync failed. Check Firestore rules.', 'error');
+          reportSyncError(error);
         });
 
         const stopSettings = subscribeToSettings(user.uid, (cloudSettings, metadata) => {
@@ -653,76 +662,55 @@ import CalendarConnectionNotice from './components/CalendarConnectionNotice';
           // an empty fresh phone never creates a blank cloud settings document.
           const hasLegacySettings = !!localSettings.googleClientId
             || JSON.stringify(localSettings) !== JSON.stringify(DEFAULT_SETTINGS);
-          if (!cloudSettings && hasLegacySettings && !migratedSettings.current) {
+          if (!metadata.fromCache && !cloudSettings && hasLegacySettings && !migratedSettings.current) {
             migratedSettings.current = true;
             updateSettingsDocument(user.uid, nextSettings).catch((error) => {
               console.error('Settings migration failed', error);
-              setSyncStatus('error');
+              reportSyncError(error);
             });
           }
         }, (error) => {
           console.error('Settings sync failed', error);
-          setSyncStatus('error');
-          notify('Settings sync failed. Check Firestore rules.', 'error');
+          reportSyncError(error);
         });
 
         return () => {
           stopTasks();
           stopSettings();
         };
-      }, [notify, user.uid]);
+      }, [listenerVersion, reportSyncError, user.uid]);
 
       // Persist settings to Firestore after local edits without echoing listener updates.
       useEffect(() => {
         storage.set('settings', settings);
         if (!settingsReady) return undefined;
         const serialized = JSON.stringify(settings);
-        if (serialized === lastCloudSettings.current) return undefined;
+        if (serialized === lastCloudSettings.current) {
+          setSettingsPending(false);
+          return undefined;
+        }
         if (settingsSaveTimer.current) window.clearTimeout(settingsSaveTimer.current);
-        setSyncStatus(online ? 'pending' : 'offline');
+        setSettingsPending(true);
         settingsSaveTimer.current = window.setTimeout(async () => {
           try {
             await updateSettingsDocument(user.uid, settings);
           } catch (error) {
             console.error('Settings save failed', error);
-            setSyncStatus('error');
+            reportSyncError(error);
+          } finally {
+            setSettingsPending(false);
           }
         }, 500);
         return () => window.clearTimeout(settingsSaveTimer.current);
-      }, [online, settings, settingsReady, user.uid]);
-
-      // Derive an honest status from connectivity and Firestore acknowledgement metadata.
-      useEffect(() => {
-        const handleOnline = () => setOnline(true);
-        const handleOffline = () => setOnline(false);
-        window.addEventListener('online', handleOnline);
-        window.addEventListener('offline', handleOffline);
-        return () => {
-          window.removeEventListener('online', handleOnline);
-          window.removeEventListener('offline', handleOffline);
-        };
-      }, []);
+      }, [reportSyncError, settings, settingsReady, user.uid]);
 
       useEffect(() => {
-        if (!online) {
-          setSyncStatus('offline');
-          return;
-        }
-        if (!tasksReady || !settingsReady) {
-          setSyncStatus('connecting');
-          return;
-        }
-        if (taskSyncMeta.hasPendingWrites || settingsSyncMeta.hasPendingWrites) {
-          setSyncStatus('pending');
-          return;
-        }
-        setSyncStatus('synced');
-        if (!taskSyncMeta.fromCache || !settingsSyncMeta.fromCache) {
+        if (syncStatus === 'synced') {
           const now = Date.now();
           setLastSyncTime(now);
           storage.set('lastSyncTime', now);
         }
-      }, [online, settingsReady, settingsSyncMeta, taskSyncMeta, tasksReady]);
+      }, [syncStatus, settingsSyncMeta, taskSyncMeta]);
 
       // When a suspended PWA resumes on a later day, move the calendar to today.
       useEffect(() => {
@@ -806,29 +794,41 @@ import CalendarConnectionNotice from './components/CalendarConnectionNotice';
       const addTask = async (task) => {
         const now = Date.now();
         const newTask = normalizeTask({ ...task, id: uid(), status: 'todo', createdAt: new Date().toISOString(), updatedAt: now });
+        setPendingTaskWrites(count => count + 1);
         try {
           await createTaskDocument(user.uid, newTask);
           notify(online ? 'Task added' : 'Task saved offline');
         } catch (error) {
           console.error('Task creation failed', error);
+          reportSyncError(error);
           notify('Task could not be saved', 'error');
+        } finally {
+          setPendingTaskWrites(count => count - 1);
         }
       };
       const updateTask = async (id, updates) => {
+        setPendingTaskWrites(count => count + 1);
         try {
           await updateTaskDocument(user.uid, id, updates);
         } catch (error) {
           console.error('Task update failed', error);
+          reportSyncError(error);
           notify('Task could not be updated', 'error');
+        } finally {
+          setPendingTaskWrites(count => count - 1);
         }
       };
       const deleteTask = async (id) => {
+        setPendingTaskWrites(count => count + 1);
         try {
           await deleteTaskDocument(user.uid, id);
           notify('Task deleted');
         } catch (error) {
           console.error('Task deletion failed', error);
+          reportSyncError(error);
           notify('Task could not be deleted', 'error');
+        } finally {
+          setPendingTaskWrites(count => count - 1);
         }
       };
       const toggleDone = (id) => {
@@ -881,18 +881,7 @@ import CalendarConnectionNotice from './components/CalendarConnectionNotice';
       };
 
       const forceSync = async () => {
-        if (!navigator.onLine) {
-          setSyncStatus('offline');
-          notify('You are offline. Changes will sync automatically.', 'error');
-          return;
-        }
-        setSyncStatus('connecting');
-        try {
-          await retryCloudSync();
-        } catch (error) {
-          console.error('Sync retry failed', error);
-          setSyncStatus('error');
-        }
+        if (await retrySync()) notify('Cloud connection checked.');
       };
 
       const refreshGCal = async () => {
@@ -1165,24 +1154,26 @@ import CalendarConnectionNotice from './components/CalendarConnectionNotice';
                   </>
                 )}
                 {(() => {
-                  let label, mobileLabel, cls, disabled = false;
+                  let label, mobileLabel, cls;
                   if (syncStatus === 'connecting') {
                     label = '↻ Connecting to cloud…';
                     mobileLabel = '↻ Connecting…';
                     cls = 'text-gray-500 bg-gray-100 border-gray-200';
-                    disabled = true;
                   } else if (syncStatus === 'pending') {
                     label = '↻ Saving changes…';
                     mobileLabel = '↻ Saving…';
                     cls = 'text-violet-700 bg-violet-50 border-violet-200';
-                    disabled = true;
                   } else if (syncStatus === 'error') {
                     label = '⚠ Sync error · retry';
                     mobileLabel = '⚠ Retry sync';
                     cls = 'text-red-600 bg-red-50 border-red-200 hover:bg-red-100';
                   } else if (syncStatus === 'offline') {
-                    label = 'Offline · changes saved on this device';
-                    mobileLabel = 'Offline';
+                    label = 'Offline · saved on this device · retry';
+                    mobileLabel = 'Offline · retry';
+                    cls = 'text-amber-700 bg-amber-50 border-amber-200 hover:bg-amber-100';
+                  } else if (syncStatus === 'disconnected') {
+                    label = 'Cloud unavailable · saved on this device · retry';
+                    mobileLabel = 'Retry cloud sync';
                     cls = 'text-amber-700 bg-amber-50 border-amber-200 hover:bg-amber-100';
                   } else {
                     label = `✓ Tasks synced ${fmt.ago(lastSyncTime)}`;
@@ -1190,9 +1181,9 @@ import CalendarConnectionNotice from './components/CalendarConnectionNotice';
                     cls = 'text-green-700 bg-green-50 border-green-200 hover:bg-green-100';
                   }
                   return (
-                    <button onClick={forceSync} disabled={disabled}
+                    <button onClick={forceSync} disabled={syncChecking}
                       className={`min-h-9 text-[10px] font-medium px-2 py-1 rounded-full border transition-colors disabled:opacity-60 ${cls}`}
-                      title="Firestore sync status">
+                      title={syncErrorMessage || 'Check cloud sync'}>
                       <span className="sm:hidden">{mobileLabel}</span>
                       <span className="hidden sm:inline">{label}</span>
                     </button>
@@ -1207,6 +1198,14 @@ import CalendarConnectionNotice from './components/CalendarConnectionNotice';
 
             {/* Content */}
             <div className="flex-1 overflow-y-auto p-4 md:p-6">
+              {syncErrorMessage && (
+                <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900" role="status">
+                  <p className="min-w-0 flex-1">{syncErrorMessage}</p>
+                  <button onClick={forceSync} disabled={syncChecking} className="min-h-9 rounded-lg border border-amber-300 px-3 font-medium disabled:opacity-50">
+                    {syncChecking ? 'Checking…' : 'Reconnect'}
+                  </button>
+                </div>
+              )}
               {!migrationComplete && legacyTasks.length > 0 && (
                 <div className="mb-4 flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-violet-200 bg-violet-50 p-4">
                   <div className="flex-1">
